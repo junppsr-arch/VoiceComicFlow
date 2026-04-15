@@ -922,15 +922,22 @@ def get_text_size(text):
 # ─────────────────────────────────────────
 def get_hovered_handle(x, y, flags=0):
     ignore_shapes = bool(flags & cv2.EVENT_FLAG_ALTKEY)
+    if ignore_shapes: return None, None
+    
+    # [AI Constraint] モードごとに掴める対象を厳密に制限。他モードの図形には絶対に干渉させない。
+    allowed_types = tuple()
+    if mode == "color": allowed_types = (BoxShape, TextShape)
+    elif mode == "line": allowed_types = (LineShape,)
+    elif mode == "numbering": allowed_types = (NumberShape, GayaShape)
+    elif mode == "manual_text": allowed_types = (ManualTextShape,)
+    elif mode == "eraser": allowed_types = (EraserShape,)
+    
+    if not allowed_types: return None, None
+
     for action in reversed(drawn_actions):
-        # Z(番号)モードの時は、NumberShapeとGayaShape以外は絶対に掴まない（枠の中へのスタンプ配置を優先）
-        if mode == "numbering" and not isinstance(action, (NumberShape, GayaShape)):
-            continue
-        # Altキー押下時、またはcolor/lineモード以外の時はBox/Lineを掴まない
-        if (ignore_shapes or mode not in ["color", "line", "numbering"]) and isinstance(action, (BoxShape, LineShape)):
-            continue
-        ha, part = action.check_hover(x, y)
-        if ha: return ha, part
+        if isinstance(action, allowed_types):
+            ha, part = action.check_hover(x, y)
+            if ha: return ha, part
     return None, None
 
 def get_deletable_action(mx, my, margin=15):
@@ -1291,141 +1298,131 @@ def render():
 
     display_out = cached_canvas.copy()
 
-    if dragging:
-        if not resizing_action and drag_start and drag_end:
-            if mode == "line":
-                cv2.line(display_out, drag_start, drag_end, current_color, 2, cv2.LINE_AA)
-            elif drag_start[0] < w_orig and mode in ["color", "manual_text"]:
+    if mouseX < w_orig:
+        if dragging:
+            if resizing_action:
+                r_type = resizing_action.shape_type if not isinstance(resizing_action, dict) else resizing_action.get("type")
+                r_region = resizing_action.region if not isinstance(resizing_action, dict) else resizing_action.get("region", [0,0,0,0])
+                r_color = getattr(resizing_action, "color", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color", (255,255,255))
+                
+                if r_type in ["number", "gaya"] and len(r_region) >= 2:
+                    nx, ny = r_region[0], r_region[1]
+                    cv2.rectangle(display_out, (int(nx)-20, int(ny)-20), (int(nx)+20, int(ny)+20), (255,255,255), 2)
+                elif r_type == "line" and len(r_region) >= 4:
+                    cv2.line(display_out, (int(r_region[0]), int(r_region[1])), (int(r_region[2]), int(r_region[3])), r_color, 2, cv2.LINE_AA)
+                elif r_type == "eraser" and len(r_region) >= 2:
+                    ex, ey = r_region[0], r_region[1]
+                    r = r_region[2] if len(r_region) >= 3 else ERASER_RADIUS
+                    cv2.circle(display_out, (int(ex), int(ey)), int(r), (0, 0, 255, 120), 2)
+                elif len(r_region) >= 4:
+                    rx1, ry1, rx2, ry2 = r_region
+                    rx1, ry1 = int(min(rx1, rx2)), int(min(ry1, ry2))
+                    rx2, ry2 = int(max(rx1, rx2)), int(max(ry1, ry2))
+                    if (rx2 - rx1) > 0 and (ry2 - ry1) > 0:
+                        shape_val = getattr(resizing_action, "shape", "") if not isinstance(resizing_action, dict) else resizing_action.get("shape")
+                        if shape_val == "ellipse":
+                            cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+                            axes = ((rx2 - rx1) // 2, (ry2 - ry1) // 2)
+                            if axes[0] > 0 and axes[1] > 0:
+                                cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, r_color, 2)
+                        else:
+                            cv2.rectangle(display_out, (rx1, ry1), (rx2, ry2), r_color, 2)
+            elif drag_start and drag_end:
                 px1, py1 = drag_start
                 px2, py2 = drag_end
-                x1, y1 = min(px1, px2), min(py1, py2)
-                x2, y2 = max(px1, px2), max(py1, py2)
-                if (x2 - x1) > 0 and (y2 - y1) > 0 and x2 <= w_orig:
-                    if draw_shape == "ellipse":
-                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                        axes = ((x2 - x1) // 2, (y2 - y1) // 2)
-                        if axes[0] > 0 and axes[1] > 0:
-                            cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, current_color, 2)
-                    else:
-                        cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
-
-        elif resizing_action:
-            r_type = resizing_action.shape_type if not isinstance(resizing_action, dict) else resizing_action.get("type")
-            r_region = resizing_action.region if not isinstance(resizing_action, dict) else resizing_action.get("region", [0,0,0,0])
-            r_color = getattr(resizing_action, "color", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color", (255,255,255))
-            
-            if r_type in ["number", "gaya"] and len(r_region) >= 2:
-                nx, ny = r_region[0], r_region[1]
-                cv2.rectangle(display_out, (int(nx)-20, int(ny)-20), (int(nx)+20, int(ny)+20), (255,255,255), 2)
-            elif r_type == "line" and len(r_region) >= 4:
-                cv2.line(display_out, (int(r_region[0]), int(r_region[1])), (int(r_region[2]), int(r_region[3])), r_color, 2, cv2.LINE_AA)
-            elif len(r_region) >= 4:
-                rx1, ry1, rx2, ry2 = r_region
-                rx1, ry1 = int(min(rx1, rx2)), int(min(ry1, ry2))
-                rx2, ry2 = int(max(rx1, rx2)), int(max(ry1, ry2))
-                if (rx2 - rx1) > 0 and (ry2 - ry1) > 0:
-                    shape_val = getattr(resizing_action, "shape", "") if not isinstance(resizing_action, dict) else resizing_action.get("shape")
-                    if shape_val == "ellipse":
-                        cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
-                        axes = ((rx2 - rx1) // 2, (ry2 - ry1) // 2)
-                        if axes[0] > 0 and axes[1] > 0:
-                            cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, r_color, 2)
-                    else:
-                        cv2.rectangle(display_out, (rx1, ry1), (rx2, ry2), r_color, 2)
-
-    if mouseX < w_orig:
-        ha, part = get_hovered_handle(mouseX, mouseY)
-        
-        for action in reversed(drawn_actions):
-            if action == ha and not dragging:
-                region = action.region if not isinstance(action, dict) else action.get("region", [])
-                s_type = action.shape_type if not isinstance(action, dict) else action.get("type", "box")
+                if mode == "line":
+                    cv2.line(display_out, drag_start, drag_end, current_color, 2, cv2.LINE_AA)
+                elif mode == "eraser":
+                    r = int(math.hypot(px2 - px1, py2 - py1))
+                    if r < 5: r = ERASER_RADIUS
+                    cv2.circle(display_out, (px1, py1), r, (0, 0, 255, 120), 2)
+                elif mode in ["color", "manual_text"]:
+                    x1, y1 = min(px1, px2), min(py1, py2)
+                    x2, y2 = max(px1, px2), max(py1, py2)
+                    if (x2 - x1) > 0 and (y2 - y1) > 0:
+                        if draw_shape == "ellipse":
+                            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                            axes = ((x2 - x1) // 2, (y2 - y1) // 2)
+                            if axes[0] > 0 and axes[1] > 0:
+                                cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, current_color, 2)
+                        else:
+                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
+        else:
+            ha, part = get_hovered_handle(mouseX, mouseY)
+            if ha and not alt_pressed:
+                s_type = ha.shape_type if not isinstance(ha, dict) else ha.get("type", "box")
+                region = ha.region if not isinstance(ha, dict) else ha.get("region", [])
                 
-                if mode == "eraser":
+                if s_type == "eraser" and len(region) >= 2:
                     ex, ey = region[0], region[1]
-                    r = region[2] if len(region) >= 3 else getattr(action, "radius", 30)
+                    r = region[2] if len(region) >= 3 else getattr(ha, "radius", 30)
                     cv2.circle(display_out, (int(ex), int(ey)), int(r), (0, 255, 255), 2)
-                    if not alt_pressed:
-                        c_color = (0, 0, 255) if part == 'center' else (255, 255, 0)
-                        cv2.rectangle(display_out, (int(ex)-8, int(ey)-8), (int(ex)+8, int(ey)+8), c_color, -1)
-                        e_color = (0, 0, 255) if part == 'edge' else (255, 255, 0)
-                        cv2.circle(display_out, (int(ex+r), int(ey)), 8, e_color, -1)
-                elif len(region) >= 4 and not alt_pressed:  # Alt押下時はハンドルを出さない
-                    if s_type == "line":
-                        ex1, ey1, ex2, ey2 = region
-                        cv2.line(display_out, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
-                        cx, cy = (ex1+ex2)//2, (ey1+ey2)//2
-                        pts = {'line_p1': (ex1, ey1), 'line_p2': (ex2, ey2), 'center': (cx, cy)}
-                        for p_name, (ptx, pty) in pts.items():
-                            c = (0, 0, 255) if part == p_name else (255, 255, 0)
-                            if not alt_pressed:
-                                cv2.rectangle(display_out, (ptx-HANDLE_DRAW_SIZE, pty-HANDLE_DRAW_SIZE), (ptx+HANDLE_DRAW_SIZE, pty+HANDLE_DRAW_SIZE), c, -1)
-                    else:
-                        x1, y1, x2, y2 = region[0], region[1], region[2], region[3]
-                        cv2.rectangle(display_out, (int(min(x1, x2)), int(min(y1, y2))), 
-                                      (int(max(x1, x2)), int(max(y1, y2))), (0, 255, 255), 2)
-                        
-                        handles = [
-                            (x1, y1), (x2, y1), (x1, y2), (x2, y2),
-                            ((x1+x2)//2, y1), ((x1+x2)//2, y2),
-                            (x1, (y1+y2)//2), (x2, (y1+y2)//2)
-                        ]
-                        if not alt_pressed:
-                            for hx, hy in handles:
-                                color = (0, 0, 255) if (part and hx == (x1 if 'left' in part else x2 if 'right' in part else (x1+x2)//2) and hy == (y1 if 'top' in part else y2 if 'bottom' in part else (y1+y2)//2)) else (255, 255, 0)
-                                cv2.rectangle(display_out, (hx-HANDLE_DRAW_SIZE, hy-HANDLE_DRAW_SIZE), (hx+HANDLE_DRAW_SIZE, hy+HANDLE_DRAW_SIZE), (255, 255, 255), -1)
-                                cv2.rectangle(display_out, (hx-HANDLE_DRAW_SIZE, hy-HANDLE_DRAW_SIZE), (hx+HANDLE_DRAW_SIZE, hy+HANDLE_DRAW_SIZE), color, 1)
-
-                        cx, cy = (x1+x2)//2, (y1+y2)//2
-                        ccolor = (0, 0, 255) if part == 'center' else (200, 200, 200)
-                        cv2.line(display_out, (cx-15, cy), (cx+15, cy), ccolor, 3)
-                        cv2.line(display_out, (cx, cy-15), (cx, cy+15), ccolor, 3)
-                        
-                elif len(region) >= 2 and not alt_pressed:  # Alt押下時はハイライトを出さない
+                    c_color = (0, 0, 255) if part == 'center' else (255, 255, 0)
+                    cv2.rectangle(display_out, (int(ex)-8, int(ey)-8), (int(ex)+8, int(ey)+8), c_color, -1)
+                    e_color = (0, 0, 255) if part == 'edge' else (255, 255, 0)
+                    cv2.circle(display_out, (int(ex+r), int(ey)), 8, e_color, -1)
+                elif s_type == "line" and len(region) >= 4:
+                    ex1, ey1, ex2, ey2 = region
+                    cv2.line(display_out, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
+                    cx, cy = (ex1+ex2)//2, (ey1+ey2)//2
+                    pts = {'line_p1': (ex1, ey1), 'line_p2': (ex2, ey2), 'center': (cx, cy)}
+                    for p_name, (ptx, pty) in pts.items():
+                        c = (0, 0, 255) if part == p_name else (255, 255, 0)
+                        cv2.rectangle(display_out, (ptx-HANDLE_DRAW_SIZE, pty-HANDLE_DRAW_SIZE), (ptx+HANDLE_DRAW_SIZE, pty+HANDLE_DRAW_SIZE), c, -1)
+                elif s_type == "box" and len(region) >= 4:
+                    x1, y1, x2, y2 = region[0], region[1], region[2], region[3]
+                    cv2.rectangle(display_out, (int(min(x1, x2)), int(min(y1, y2))), (int(max(x1, x2)), int(max(y1, y2))), (0, 255, 255), 2)
+                    handles = [
+                        (x1, y1), (x2, y1), (x1, y2), (x2, y2),
+                        ((x1+x2)//2, y1), ((x1+x2)//2, y2),
+                        (x1, (y1+y2)//2), (x2, (y1+y2)//2)
+                    ]
+                    for hx, hy in handles:
+                        color = (0, 0, 255) if (part and hx == (x1 if 'left' in part else x2 if 'right' in part else (x1+x2)//2) and hy == (y1 if 'top' in part else y2 if 'bottom' in part else (y1+y2)//2)) else (255, 255, 0)
+                        cv2.rectangle(display_out, (hx-HANDLE_DRAW_SIZE, hy-HANDLE_DRAW_SIZE), (hx+HANDLE_DRAW_SIZE, hy+HANDLE_DRAW_SIZE), (255, 255, 255), -1)
+                        cv2.rectangle(display_out, (hx-HANDLE_DRAW_SIZE, hy-HANDLE_DRAW_SIZE), (hx+HANDLE_DRAW_SIZE, hy+HANDLE_DRAW_SIZE), color, 1)
+                    cx, cy = (x1+x2)//2, (y1+y2)//2
+                    ccolor = (0, 0, 255) if part == 'center' else (200, 200, 200)
+                    cv2.line(display_out, (cx-15, cy), (cx+15, cy), ccolor, 3)
+                    cv2.line(display_out, (cx, cy-15), (cx, cy+15), ccolor, 3)
+                elif len(region) >= 2:
                     tx, ty = region[0], region[1]
                     if s_type in ["number", "gaya"]:
                         cv2.rectangle(display_out, (int(tx)-30, int(ty)-30), (int(tx)+30, int(ty)+30), (0, 255, 255), 2)
-                    elif s_type == "text":
+                    elif s_type in ["text", "manual_text"]:
                         cv2.rectangle(display_out, (int(tx)-10, int(ty)-10), (int(tx)+100, int(ty)+40), (0, 255, 255), 2)
-                break
-        else:
-            if mode in ["color", "manual_text", "line"] and not dragging:
-                hb = hovered_yolo_box(mouseX, mouseY)
-                if hb and yolo_enabled and not alt_pressed:
-                    x1, y1, x2, y2 = hb
-                    if draw_shape == "ellipse":
-                        cx_y, cy_y = (x1 + x2) // 2, (y1 + y2) // 2
-                        axes_y = ((x2 - x1) // 2, (y2 - y1) // 2)
-                        if axes_y[0] > 0 and axes_y[1] > 0:
-                            cv2.ellipse(display_out, (cx_y, cy_y), axes_y, 0, 0, 360, current_color, 2)
-                    else:
-                        cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
-            elif mode == "numbering":
-                cv2.line(display_out, (mouseX-10, mouseY), (mouseX+10, mouseY), (200,200,200), 1)
-                cv2.line(display_out, (mouseX, mouseY-10), (mouseX, mouseY+10), (200,200,200), 1)
-            elif mode == "eraser":
-                if dragging and drag_start:
-                    px, py = drag_start
-                    r = int(math.hypot(mouseX - px, mouseY - py))
-                    if r < 5: r = ERASER_RADIUS
-                    cv2.circle(display_out, (px, py), r, (0, 0, 255, 120), 2)
-                else:
+            else:
+                if mode == "delete":
+                    target_action = get_deletable_action(mouseX, mouseY)
+                    if target_action:
+                        t = target_action.shape_type if not isinstance(target_action, dict) else target_action.get("type", "")
+                        region = target_action.region if not isinstance(target_action, dict) else target_action.get("region", [])
+                        if t in ["box", "text", "manual_text"] and len(region) >= 4:
+                            x1, y1, x2, y2 = region[0], region[1], region[2], region[3]
+                            cv2.rectangle(display_out, (min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2)), (0, 0, 255), 3)
+                        elif t == "line" and len(region) >= 4:
+                            cv2.line(display_out, (region[0], region[1]), (region[2], region[3]), (0, 0, 255), LINE_THICKNESS + 4)
+                        elif t in ["number", "gaya"] and len(region) >= 2:
+                            cv2.circle(display_out, (region[0], region[1]), NUMBER_SIZE//2 + 5, (0, 0, 255), 3)
+                        elif t == "eraser" and len(region) >= 2:
+                            r = region[2] if len(region) >= 3 else ERASER_RADIUS
+                            cv2.circle(display_out, (region[0], region[1]), r, (0, 0, 255), 3)
+                elif mode == "eraser":
                     cv2.circle(display_out, (mouseX, mouseY), ERASER_RADIUS, (255, 255, 255), 2)
-            elif mode == "delete":
-                target_action = get_deletable_action(mouseX, mouseY)
-                if target_action:
-                    t = target_action.shape_type if not isinstance(target_action, dict) else target_action.get("type", "")
-                    region = target_action.region if not isinstance(target_action, dict) else target_action.get("region", [])
-                    if t in ["box", "text", "manual_text"] and len(region) >= 4:
-                        x1, y1, x2, y2 = region[0], region[1], region[2], region[3]
-                        cv2.rectangle(display_out, (min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2)), (0, 0, 255), 3)
-                    elif t == "line" and len(region) >= 4:
-                        cv2.line(display_out, (region[0], region[1]), (region[2], region[3]), (0, 0, 255), LINE_THICKNESS + 4)
-                    elif t in ["number", "gaya"] and len(region) >= 2:
-                        cv2.circle(display_out, (region[0], region[1]), NUMBER_SIZE//2 + 5, (0, 0, 255), 3)
-                    elif t == "eraser" and len(region) >= 2:
-                        r = region[2] if len(region) >= 3 else getattr(target_action, "radius", ERASER_RADIUS) if not isinstance(target_action, dict) else ERASER_RADIUS
-                        cv2.circle(display_out, (region[0], region[1]), r, (0, 0, 255), 3)
+                elif mode == "numbering":
+                    cv2.line(display_out, (mouseX-10, mouseY), (mouseX+10, mouseY), (200,200,200), 1)
+                    cv2.line(display_out, (mouseX, mouseY-10), (mouseX, mouseY+10), (200,200,200), 1)
+                elif mode in ["color", "manual_text", "line"]:
+                    hb = hovered_yolo_box(mouseX, mouseY)
+                    if hb and yolo_enabled and not alt_pressed:
+                        x1, y1, x2, y2 = hb
+                        if draw_shape == "ellipse":
+                            cx_y, cy_y = (x1 + x2) // 2, (y1 + y2) // 2
+                            axes_y = ((x2 - x1) // 2, (y2 - y1) // 2)
+                            if axes_y[0] > 0 and axes_y[1] > 0:
+                                cv2.ellipse(display_out, (cx_y, cy_y), axes_y, 0, 0, 360, current_color, 2)
+                        else:
+                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
 
     if show_help:
         overlay = get_help_overlay(display_out.shape[1], display_out.shape[0])
@@ -1750,26 +1747,20 @@ def mouse_callback(event, x, y, flags, param):
                 request_render()
                 render()
             return
-            
-        if mode == "eraser":
-            dragging = True
-            drag_start = (ix, iy)
-            drag_end = (ix, iy)
-            return
 
+        # [AI Constraint] 全モード共通の掴み判定。特定のモードをここでreturnで弾かないこと。
         dragging   = True
         drag_start = (ix, iy)
         drag_end   = (ix, iy)
 
-        if mode in ["color", "manual_text", "line", "numbering"]:
-            ha, part = get_hovered_handle(ix, iy, flags)
-            if ha:
-                save_undo_state()
-                resizing_action = ha
-                resizing_part   = part
-                drag_start_region = list(ha.region) if not isinstance(ha, dict) else list(ha.get("region", []))
-            else:
-                resizing_action = None
+        ha, part = get_hovered_handle(ix, iy, flags)
+        if ha:
+            save_undo_state()
+            resizing_action = ha
+            resizing_part   = part
+            drag_start_region = list(ha.region) if not isinstance(ha, dict) else list(ha.get("region", []))
+        else:
+            resizing_action = None
         
         if mode == "manual_text" and not resizing_action:
             root = tk.Tk()
@@ -1790,7 +1781,7 @@ def mouse_callback(event, x, y, flags, param):
     elif event == cv2.EVENT_MOUSEMOVE:
         if dragging and ix < w_orig:
             drag_end = (ix, iy)
-            if mode == "eraser":
+            if mode == "eraser" and not resizing_action:
                 render()
             elif resizing_action and drag_start_region:
                 px, py = drag_start
@@ -1855,26 +1846,29 @@ def mouse_callback(event, x, y, flags, param):
         drag_end = (ix, iy)
         dragging = False
 
+        # [AI Constraint] 新規作成より先に「既存図形の編集完了」を処理する。
+        # また、座標数が4未満の図形(Number, Eraser等)でのアンパックエラー(クラッシュ)を防ぐため、len >= 4 のチェックを必須とする。
+        if resizing_action:
+            if len(resizing_action.region) >= 4:
+                rx1, ry1, rx2, ry2 = resizing_action.region
+                if not isinstance(resizing_action, LineShape):
+                    resizing_action.region = [min(rx1, rx2), min(ry1, ry2), max(rx1, rx2), max(ry1, ry2)]
+                
+                if isinstance(resizing_action, ManualTextShape):
+                    new_h = abs(ry2 - ry1)
+                    resizing_action.font_size = max(5, int(new_h * 0.85))
+
+            resizing_action = None
+            request_render()
+            render()
+            return
+
         if mode == "eraser":
             px, py = drag_start
             r = int(math.hypot(ix - px, iy - py))
             if r < 5: r = ERASER_RADIUS
             save_undo_state()
             drawn_actions.append(EraserShape([px, py, r]))
-            request_render()
-            render()
-            return
-
-        if resizing_action:
-            rx1, ry1, rx2, ry2 = resizing_action.region
-            if not isinstance(resizing_action, LineShape):
-                resizing_action.region = [min(rx1, rx2), min(ry1, ry2), max(rx1, rx2), max(ry1, ry2)]
-            
-            if isinstance(resizing_action, ManualTextShape):
-                new_h = abs(ry2 - ry1)
-                resizing_action.font_size = max(5, int(new_h * 0.85))
-
-            resizing_action = None
             request_render()
             render()
             return
@@ -2351,23 +2345,26 @@ while True:
     # [AI Constraint] ウィンドウ比率の強制スナップ（吸着）処理。
     # OpenCV標準ではフレーム比率を固定できないため、毎フレーム検知して補正している。
     # 汚いロジックに見えてもこれが最適解。絶対に他のスマートな処理に書き換えたり、削除したりしないこと。
-    rect = cv2.getWindowImageRect(WIN_NAME)
-    if rect[2] > 0 and rect[3] > 0 and h > 0:
-        win_w, win_h = rect[2], rect[3]
-        if win_w != last_win_w or win_h != last_win_h:
-            target_ratio = (w_orig + HUD_WIDTH) / h
-            if win_w != last_win_w and win_h == last_win_h:
-                new_h = int(win_w / target_ratio)
-                cv2.resizeWindow(WIN_NAME, win_w, new_h)
-                last_win_w, last_win_h = win_w, new_h
-            elif win_h != last_win_h and win_w == last_win_w:
-                new_w = int(win_h * target_ratio)
-                cv2.resizeWindow(WIN_NAME, new_w, win_h)
-                last_win_w, last_win_h = new_w, win_h
-            else:
-                new_h = int(win_w / target_ratio)
-                cv2.resizeWindow(WIN_NAME, win_w, new_h)
-                last_win_w, last_win_h = win_w, new_h
+    try:
+        rect = cv2.getWindowImageRect(WIN_NAME)
+        if rect[2] > 0 and rect[3] > 0 and h > 0:
+            win_w, win_h = rect[2], rect[3]
+            if win_w != last_win_w or win_h != last_win_h:
+                target_ratio = (w_orig + HUD_WIDTH) / h
+                if win_w != last_win_w and win_h == last_win_h:
+                    new_h = int(win_w / target_ratio)
+                    cv2.resizeWindow(WIN_NAME, win_w, new_h)
+                    last_win_w, last_win_h = win_w, new_h
+                elif win_h != last_win_h and win_w == last_win_w:
+                    new_w = int(win_h * target_ratio)
+                    cv2.resizeWindow(WIN_NAME, new_w, win_h)
+                    last_win_w, last_win_h = new_w, win_h
+                else:
+                    new_h = int(win_w / target_ratio)
+                    cv2.resizeWindow(WIN_NAME, win_w, new_h)
+                    last_win_w, last_win_h = win_w, new_h
+    except cv2.error:
+        pass
 
     if pending_gui_action == "color":
         run_color_chooser(pending_gui_param)
