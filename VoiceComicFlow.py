@@ -23,21 +23,36 @@ VoiceComicFlow.py  ─  オールインPythonアーキテクチャ (ボイスコ
 ・キャッシュレンダリングによる高速化＆手動レターボックス座標逆算
 """
 
-import cv2
-import numpy as np
-from ultralytics import YOLO
+import sys
 import os
-import csv
-import json
-import threading
-import copy
-import math
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import simpledialog
 from tkinter import colorchooser
-from tkinter import ttk  # 出力設定ダイアログ用
+from tkinter import ttk
+
+# [AI Constraint] 起動速度を最速にするため、重いライブラリのロード前にPDF選択ダイアログを出す
+_root = tk.Tk()
+_root.withdraw()
+PDF_PATH = filedialog.askopenfilename(
+    title="作業するPDFファイルを選択してください",
+    filetypes=[("PDF files", "*.pdf")]
+)
+if not PDF_PATH:
+    print("ファイルが選択されませんでした。終了します。")
+    sys.exit()
+print("ライブラリを読み込んでいます。少々お待ちください...")
+
+# 重いライブラリの遅延インポート
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import csv
+import json
+import threading
+import copy
+import math
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw, ImageFont
 import time
@@ -305,53 +320,18 @@ def request_render():
     need_full_render = True
 
 # ─────────────────────────────────────────
-# デバウンス式ページ遷移管理
+# ページ遷移管理 (メモリキャッシュによる即時ロード)
 # ─────────────────────────────────────────
-last_scroll_time  = 0.0
-pending_page_load = False
-
 def trigger_page_change(new_idx):
-    global page_idx, last_scroll_time, pending_page_load
-    global img, h, w_orig, drawn_actions
-
-    # 完全に読み込まれているページから離れる時のみ保存する
-    if not pending_page_load:
-        save_current_page()
-
+    global page_idx
+    save_current_page()
     page_idx = new_idx
-    last_scroll_time = time.time()
-    pending_page_load = True
-
-    # ▼ 漫画ページだけの即時表示処理（超軽量）
-    # 描画枠を一時クリアして合成処理のコストをゼロにする
-    drawn_actions = []
-    if page_idx in PAGE_CACHE:
-        # バックグラウンド先読み済みの画像があれば、メモリから一瞬で表示
-        cache_img, ch, cw = PAGE_CACHE[page_idx]
-        img = cache_img.copy()
-        h, w_orig = ch, cw
-
-    # 新しいインデックス周辺の画像先読みをバックグラウンドで開始
-    threading.Thread(target=prefetch_pages, args=(page_idx,), daemon=True).start()
-
-    request_render()  # ベース画像とHUDだけを即時描画
+    load_page(page_idx)
 
 # ─────────────────────────────────────────
 # 3. 初期化とデータ読み込み (PDF, YOLO, 設定)
 # ─────────────────────────────────────────
-_root = tk.Tk()
-_root.withdraw()
-
-
-# 2. PDF読み込み
-PDF_PATH = filedialog.askopenfilename(
-    title="作業するPDFファイルを選択してください",
-    filetypes=[("PDF files", "*.pdf")]
-)
-
-if not PDF_PATH:
-    print("ファイルが選択されませんでした。終了します。")
-    exit()
+# ※PDFパスの取得(_root = tk.Tk()等)は起動高速化のためスクリプト先頭に移動済み
 
 try:
     doc = fitz.open(PDF_PATH)
@@ -453,7 +433,13 @@ print(f"📁 出力先: {OUTPUT_BASE}")
 SHARED_WORK_DIR = os.path.join(PDF_DIR, "_work_data")
 os.makedirs(SHARED_WORK_DIR, exist_ok=True)
 yolo_path = os.path.join(SHARED_WORK_DIR, "yolov8n.pt")
-model = YOLO(yolo_path)
+model = None
+
+def _bg_load_yolo():
+    global model
+    try: model = YOLO(yolo_path)
+    except: pass
+threading.Thread(target=_bg_load_yolo, daemon=True).start()
 
 # グローバル状態
 alt_pressed    = False
@@ -471,12 +457,12 @@ undo_stack     = []
 redo_stack     = []
 number_counter = 1
 next_group_id  = 1
-global_char_first_page = {}
 show_help      = False
 PAGE_CACHE     = {}   # {page_idx: (img_bgr, h, w_orig)}
 GLOBAL_MEMORY  = {}   # {page_idx: {"drawn_actions": [], "number_counter": 1, "is_dirty": False}}
 PAGE_IS_DIRTY  = False
 shift_pressed  = False
+persistent_char_vars = {} # 登場一覧のチェック状態を記憶
 
 def save_undo_state():
     global undo_stack, redo_stack, PAGE_IS_DIRTY
@@ -491,9 +477,6 @@ def mark_dirty():
 # キャッシュレンダリング用
 cached_canvas  = None
 need_full_render = True
-
-# キャラ別登場一覧 (ページ単位の登場キャラ名リスト)
-page_records = {}  # {page_idx: set(char_names)}
 
 mouseX, mouseY = 0, 0
 draw_shape     = "rect"
@@ -564,7 +547,7 @@ def load_page(idx: int):
     def _run_yolo(frame, p_idx):
         global bboxes, yolo_running
         time.sleep(0.4)  # UI描画と操作を最優先するため、YOLO起動を意図的に遅延
-        if not yolo_enabled:
+        if not yolo_enabled or model is None:
             with yolo_lock:
                 bboxes = []
                 yolo_running = False
@@ -1226,7 +1209,15 @@ def render():
         if 1 <= logical_num <= TOTAL_PAGES: page_text = f"Page: {logical_num:02d} / {TOTAL_PAGES:02d}"
         elif logical_num < 1: page_text = f"Cover (P{page_idx+1})"
         else: page_text = f"Extra (P{logical_num:02d})"
-        put_hud_text(display, page_text, hud_x, y, fg=(0, 255, 255)); y+=HUD_TEXT_LINE_SPACING
+        
+        global page_jump_y_range
+        page_jump_y_range = (y - 25, y + 5)
+        if mouseX >= w_orig and page_jump_y_range[0] <= mouseY <= page_jump_y_range[1]:
+            cv2.rectangle(display, (w_orig+5, y-20), (w_orig+HUD_WIDTH-5, y+5), (70, 70, 70), -1)
+            put_hud_text(display, f"▼ {page_text}", hud_x, y, fg=(255, 255, 255))
+        else:
+            put_hud_text(display, f"▼ {page_text}", hud_x, y, fg=(0, 255, 255))
+        y += HUD_TEXT_LINE_SPACING
         
         if mode == "color": m_label = "COLOR MODE"
         elif mode == "numbering": m_label = "NUMBER MODE"
@@ -1517,7 +1508,7 @@ def get_used_characters():
 def open_export_dialog():
     dialog = tk.Toplevel(_root)
     dialog.title("一括出力設定")
-    dialog.geometry("500x600")
+    dialog.geometry("550x850") # ボタンが隠れないよう高さを確保
     dialog.attributes('-topmost', True)
 
     style = ttk.Style(dialog)
@@ -1535,7 +1526,7 @@ def open_export_dialog():
 
     ttk.Label(main_frame, text="【基本出力項目】", font=("", 12, "bold")).pack(anchor=tk.W, pady=(0, 10))
     ttk.Checkbutton(main_frame, text="完成版PDFを出力", variable=var_pdf).pack(anchor=tk.W, pady=2)
-    ttk.Checkbutton(main_frame, text="登場一覧表(CSV)を出力", variable=var_csv).pack(anchor=tk.W, pady=2)
+    ttk.Checkbutton(main_frame, text="登場一覧表(TXT/タブ区切り)を出力", variable=var_csv).pack(anchor=tk.W, pady=2)
     ttk.Checkbutton(main_frame, text="レイヤー別PSDを出力 (GIMP等で編集可能)", variable=var_psd_layers).pack(anchor=tk.W, pady=2)
     
     page_frame = ttk.Frame(main_frame)
@@ -1544,38 +1535,76 @@ def open_export_dialog():
     ttk.Entry(page_frame, textvariable=page_range_var, width=15).pack(side=tk.LEFT, padx=5)
     
     ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
-    ttk.Checkbutton(main_frame, text="キャラ別抜き台本(PDF)を出力 [未実装]", variable=var_extract, state=tk.DISABLED).pack(anchor=tk.W, pady=(0, 5))
+    ttk.Checkbutton(main_frame, text="キャラ別抜き台本(PDF)を出力 (チェック済みのキャラ)", variable=var_extract).pack(anchor=tk.W, pady=(0, 5))
     
-    char_frame_container = ttk.LabelFrame(main_frame, text="抜き出し対象キャラクター", padding="10 10 10 10")
+    char_frame_container = ttk.LabelFrame(main_frame, text="抜き出し対象キャラクター (リストから直接選択/解除)", padding="5 5 5 5")
     char_frame_container.pack(fill=tk.BOTH, expand=True, padx=20)
     
     btn_frame = ttk.Frame(char_frame_container)
-    btn_frame.pack(fill=tk.X, pady=(0, 10))
+    btn_frame.pack(fill=tk.X, pady=(0, 5))
+    
+    tree_frame = ttk.Frame(char_frame_container)
+    tree_frame.pack(fill=tk.BOTH, expand=True)
+    
+    scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+    scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL)
+    
+    tree = ttk.Treeview(tree_frame, columns=("check", "name", "count", "pages"), show="headings", height=10, yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+    scroll_y.config(command=tree.yview)
+    scroll_x.config(command=tree.xview)
+    
+    tree.heading("check", text="☑")
+    tree.heading("name", text="キャラ名")
+    tree.heading("count", text="セリフ数")
+    tree.heading("pages", text="登場ページ")
+    
+    tree.column("check", width=40, anchor=tk.CENTER, stretch=False)
+    tree.column("name", width=120, anchor=tk.W)
+    tree.column("count", width=60, anchor=tk.CENTER)
+    tree.column("pages", width=300, anchor=tk.W)
+    
+    tree.grid(row=0, column=0, sticky="nsew")
+    scroll_y.grid(row=0, column=1, sticky="ns")
+    scroll_x.grid(row=1, column=0, sticky="ew")
+    tree_frame.grid_rowconfigure(0, weight=1)
+    tree_frame.grid_columnconfigure(0, weight=1)
+
+    char_to_count, char_to_pages = get_character_stats()
+    global persistent_char_vars
+    
+    sorted_chars = sorted(char_to_pages.keys(), key=lambda x: char_to_count.get(x, 0), reverse=True)
+    for cname in sorted_chars:
+        count = char_to_count.get(cname, 0)
+        pages_str = compress_page_ranges(char_to_pages[cname])
+        
+        # 過去の選択があればそれを使い、無ければデフォルトTrue
+        is_checked = persistent_char_vars.get(cname, True)
+        persistent_char_vars[cname] = is_checked
+        
+        box_icon = "☑" if is_checked else "☐"
+        tree.insert("", tk.END, iid=cname, values=(box_icon, cname, count, pages_str))
+        
+    def toggle_check(event):
+        region = tree.identify_region(event.x, event.y)
+        if region == "cell":
+            item = tree.identify_row(event.y)
+            if item:
+                persistent_char_vars[item] = not persistent_char_vars.get(item, True)
+                new_box = "☑" if persistent_char_vars[item] else "☐"
+                vals = tree.item(item, "values")
+                tree.item(item, values=(new_box, vals[1], vals[2], vals[3]))
+                
+    tree.bind("<ButtonRelease-1>", toggle_check)
     
     def set_all_chars(state):
-        for v in char_vars.values(): v.set(state)
-        
+        box = "☑" if state else "☐"
+        for item in tree.get_children():
+            persistent_char_vars[item] = state
+            vals = tree.item(item, "values")
+            tree.item(item, values=(box, vals[1], vals[2], vals[3]))
+
     ttk.Button(btn_frame, text="全選択", command=lambda: set_all_chars(True)).pack(side=tk.LEFT, padx=(0, 5))
     ttk.Button(btn_frame, text="全解除", command=lambda: set_all_chars(False)).pack(side=tk.LEFT)
-
-    char_grid = ttk.Frame(char_frame_container)
-    char_grid.pack(fill=tk.BOTH, expand=True)
-    
-    used_chars = get_used_characters()
-    max_rows = 5
-    
-    for i, p in enumerate(PALETTE):
-        name = p["name"]
-        is_used = name in used_chars
-        c_var = tk.BooleanVar(dialog, value=is_used)
-        char_vars[name] = c_var
-        
-        fg_color = "black" if is_used else "gray"
-        cb = tk.Checkbutton(char_grid, text=name, variable=c_var, fg=fg_color)
-        
-        row = i % max_rows
-        col = i // max_rows
-        cb.grid(row=row, column=col, sticky=tk.W, padx=5, pady=2)
 
     exec_frame = ttk.Frame(main_frame)
     exec_frame.pack(fill=tk.X, pady=(20, 0))
@@ -1603,7 +1632,7 @@ def open_export_dialog():
                     target_pages.add(int(part))
                     
         progress["value"] = 0
-        total_tasks = int(var_pdf.get()) + int(var_csv.get()) + int(var_psd_layers.get())
+        total_tasks = int(var_pdf.get()) + int(var_csv.get()) + int(var_psd_layers.get()) + int(var_extract.get())
         if total_tasks == 0:
             messagebox.showinfo("確認", "出力項目が選択されていません。")
             return
@@ -1613,7 +1642,7 @@ def open_export_dialog():
         
         try:
             if var_csv.get():
-                status_label.config(text="登場一覧表(CSV)を出力中...")
+                status_label.config(text="登場一覧表(TXT)を出力中...")
                 dialog.update()
                 export_character_pages_csv()
                 current_task += 1
@@ -1633,6 +1662,16 @@ def open_export_dialog():
                 current_task += 1
                 progress["value"] = current_task
 
+            if var_extract.get():
+                status_label.config(text="キャラ別抜き台本を出力中...")
+                dialog.update()
+                # persistent_char_vars からチェックされているキャラのみ抽出
+                selected_chars = [c for c, v in persistent_char_vars.items() if v]
+                if selected_chars:
+                    export_to_script_pdf(selected_chars, target_pages)
+                current_task += 1
+                progress["value"] = current_task
+
             status_label.config(text="出力完了！")
             dialog.update()
             dialog.after(800, dialog.destroy)
@@ -1649,6 +1688,11 @@ def handle_hud_click(mx, my, flags):
     global pending_gui_action, pending_gui_param
     hud_x = w_orig + 10
     
+    if 'page_jump_y_range' in globals() and page_jump_y_range[0] <= my <= page_jump_y_range[1]:
+        pending_gui_action = "page_jump"
+        request_render()
+        return
+
     if 'yolo_y_range' in globals() and yolo_y_range[0] <= my <= yolo_y_range[1]:
         yolo_enabled = not yolo_enabled
         request_render(); return
@@ -1747,6 +1791,71 @@ def run_add_char_dialog():
         dlg.destroy()
     tk.Button(dlg, text="一括追加", command=on_add, width=20).pack(pady=10)
     dlg.grab_set(); dlg.wait_window(dlg)
+
+def run_page_jump_dialog():
+    dlg = tk.Toplevel(_root)
+    dlg.title("ページジャンプ")
+    dlg.geometry("450x600")
+    dlg.attributes('-topmost', True)
+    
+    ttk.Label(dlg, text="移動するページをダブルクリック（または選択してEnter）:", font=("", 10)).pack(pady=10)
+    
+    frame = ttk.Frame(dlg)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    
+    scrollbar = ttk.Scrollbar(frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    listbox = tk.Listbox(frame, yscrollcommand=scrollbar.set, font=("", 11), selectbackground="#0078D7")
+    
+    page_indices = []
+    for p in range(len(doc)):
+        logical_num = p - LOGICAL_PAGE_OFFSET + 1
+        if 1 <= logical_num <= TOTAL_PAGES: p_label = f"P{logical_num:02d}"
+        elif logical_num < 1: p_label = f"表紙等"
+        else: p_label = f"おまけ"
+        p_label += f" (物理:{p+1:02d}) "
+            
+        mem = GLOBAL_MEMORY.get(p, {})
+        acts = drawn_actions if p == page_idx else mem.get("drawn_actions", [])
+        
+        # ボックスとテキストに登録されたキャラ名と、ガヤのベース名を抽出
+        chars = set()
+        for a in acts:
+            cnames = getattr(a, "char_names", [getattr(a, "char_name", "")])
+            if getattr(a, "shape_type", "") == "gaya":
+                cnames.append(getattr(a, "base_name", ""))
+            for c in cnames:
+                if c: chars.add(c)
+                
+        if chars: p_label += f"  [{', '.join(chars)}]"
+            
+        listbox.insert(tk.END, p_label)
+        page_indices.append(p)
+        if p == page_idx:
+            listbox.itemconfig(tk.END, {'bg': '#E0F0FF'})
+        
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=listbox.yview)
+    
+    listbox.selection_set(page_idx)
+    listbox.see(page_idx)
+    
+    def on_select(event=None):
+        sel = listbox.curselection()
+        if sel:
+            target_p = page_indices[sel[0]]
+            if target_p != page_idx:
+                trigger_page_change(target_p)
+        dlg.destroy()
+        
+    listbox.bind("<Double-Button-1>", on_select)
+    listbox.bind("<Return>", on_select)
+    ttk.Button(dlg, text="ジャンプ", command=on_select, padding=5).pack(pady=10)
+    
+    dlg.grab_set()
+    dlg.wait_window(dlg)
+
 
 def delete_character(idx):
     global current_palette_idx, current_color, current_name, char_delete_mode
@@ -2006,27 +2115,23 @@ def mouse_callback(event, x, y, flags, param):
                         if isinstance(act, TextShape) and getattr(act, "char_name", "") == current_name:
                             drawn_actions.remove(act)
                             
-                    # ★追加: 他の全ページ（セーブデータ）からも古い名前ラベルを消し去る
-                    for p in range(len(doc)):
+                    # ★修正: ディスクアクセスを廃止し GLOBAL_MEMORY 上でクリーンアップ
+                    for p in range(TOTAL_PAGES):
                         if p == page_idx: continue
-                        state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
-                        if os.path.exists(state_file):
-                            try:
-                                with open(state_file, "r", encoding="utf-8") as f:
-                                    p_state = json.load(f)
-                                
-                                # TextShapeかつ名前が一致するものを除外してリストを再構築
-                                original_len = len(p_state.get("drawn_actions", []))
-                                p_state["drawn_actions"] = [
-                                    a for a in p_state.get("drawn_actions", []) 
-                                    if not (a.get("type") == "text" and a.get("char_name") == current_name)
-                                ]
-                                
-                                # 変更があった場合のみ上書き保存
-                                if len(p_state["drawn_actions"]) != original_len:
-                                    with open(state_file, "w", encoding="utf-8") as f:
-                                        json.dump(p_state, f, ensure_ascii=False, indent=2)
-                            except: pass
+                        mem = GLOBAL_MEMORY.get(p, {})
+                        acts = mem.get("drawn_actions", [])
+                        original_len = len(acts)
+                        
+                        # TextShapeかつ名前が一致するものを除外
+                        filtered_acts = [
+                            a for a in acts 
+                            if not (getattr(a, "shape_type", "") == "text" and getattr(a, "char_name", "") == current_name)
+                        ]
+                        
+                        if len(filtered_acts) != original_len:
+                            GLOBAL_MEMORY[p]["drawn_actions"] = filtered_acts
+                            GLOBAL_MEMORY[p]["is_dirty"] = True
+                            _async_save_bg(p, filtered_acts, mem.get("number_counter", 1))
                     
                     # b) 次の番号を取得
                     next_num = get_next_gaya_number(current_name)
@@ -2075,8 +2180,6 @@ def _make_serializable(obj):
     return obj
 
 def _async_save_bg(p_idx, actions, n_cnt):
-    used_chars = set(getattr(a, "char_name", None) for a in actions if getattr(a, "char_name", None))
-    page_records[p_idx] = used_chars
     out_dir = os.path.join(OUTPUT_BASE, f"Page {p_idx + 1}")
     os.makedirs(out_dir, exist_ok=True)
     try:
@@ -2096,100 +2199,89 @@ def save_current_page():
     threading.Thread(target=_async_save_bg, args=(page_idx, drawn_actions, number_counter), daemon=True).start()
     PAGE_IS_DIRTY = False
 
+def get_character_stats():
+    char_to_pages = {}
+    char_to_count = {}
+    processed_groups = set()
+
+    for p in range(TOTAL_PAGES):
+        logical_num = p - LOGICAL_PAGE_OFFSET + 1
+        if logical_num < 1 or logical_num > TOTAL_PAGES: continue
+        mem = GLOBAL_MEMORY.get(p, {})
+        acts = drawn_actions if p == page_idx else mem.get("drawn_actions", [])
+        
+        page_chars = set()
+        for act in acts:
+            # Shapeオブジェクトまたはdictの両方に対応
+            if hasattr(act, "to_dict"):
+                cnames = getattr(act, "char_names", [getattr(act, "char_name", "")])
+                t = getattr(act, "shape_type", "")
+                gid = getattr(act, "group_id", 0)
+            else:
+                cnames = act.get("char_names", [act.get("char_name", "")])
+                t = act.get("type", "")
+                gid = act.get("group_id", 0)
+            
+            for cname in cnames:
+                if not cname: continue
+                page_chars.add(cname)
+                if t == "box":
+                    unique_gid = f"{gid}_{cname}"
+                    if unique_gid not in processed_groups:
+                        char_to_count[cname] = char_to_count.get(cname, 0) + 1
+                        processed_groups.add(unique_gid)
+                elif t == "line":
+                    char_to_count[cname] = char_to_count.get(cname, 0) + 1
+                    
+        for cname in page_chars:
+            if cname not in char_to_pages: char_to_pages[cname] = []
+            char_to_pages[cname].append(f"P{logical_num:02d}")
+            
+    return char_to_count, char_to_pages
 
 def compress_page_ranges(page_labels):
     nums = []
     others = []
     for lbl in page_labels:
-        if lbl.startswith("P") and lbl[1:].isdigit():
-            nums.append(int(lbl[1:]))
-        else:
-            others.append(lbl)
-    
+        if lbl.startswith("P") and lbl[1:].isdigit(): nums.append(int(lbl[1:]))
+        else: others.append(lbl)
     nums = sorted(list(set(nums)))
     ranges = []
     if nums:
-        start = nums[0]
-        prev = nums[0]
+        start = prev = nums[0]
         for n in nums[1:]:
-            if n == prev + 1:
-                prev = n
+            if n == prev + 1: prev = n
             else:
                 if start == prev: ranges.append(f"P{start:02d}")
                 else: ranges.append(f"P{start:02d}-{prev:02d}")
-                start = n
-                prev = n
+                start = prev = n
         if start == prev: ranges.append(f"P{start:02d}")
         else: ranges.append(f"P{start:02d}-{prev:02d}")
-        
     return ", ".join(others + ranges)
 
 def export_character_pages_csv():
-    char_to_pages = {}
-    char_to_count = {}
-
-    for p in range(len(doc)):
-        logical_num = p - LOGICAL_PAGE_OFFSET + 1
-        if logical_num < 1 or logical_num > TOTAL_PAGES:
-            continue
-            
-        state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                
-                page_chars = set()
-                processed_groups = set()
-
-                for act in state.get("drawn_actions", []):
-                    # BoxShapeが保持する複数キャラ名(char_names)を優先取得
-                    cnames = act.get("char_names", [act.get("char_name")])
-                    t = act.get("type")
-                    gid = act.get("group_id", 0)
-                    
-                    for cname in cnames:
-                        if not cname: continue
-                        page_chars.add(cname)
-                        
-                        if t == "box":
-                            # グループ+キャラ名の複合キーで重複カウントを防止
-                            unique_gid = f"{gid}_{cname}"
-                            if unique_gid not in processed_groups:
-                                char_to_count[cname] = char_to_count.get(cname, 0) + 1
-                                processed_groups.add(unique_gid)
-                        elif t == "line":
-                            char_to_count[cname] = char_to_count.get(cname, 0) + 1
-                        
-            except Exception:
-                pass
-            
-            for cname in page_chars:
-                if cname not in char_to_pages:
-                    char_to_pages[cname] = []
-                page_label = f"P{logical_num:02d}"
-                char_to_pages[cname].append(page_label)
-            
-    out_csv = os.path.join(EXPORT_DIR, f"_{clean_base_name}_character_pages.csv")
+    char_to_count, char_to_pages = get_character_stats()
+    out_txt = os.path.join(EXPORT_DIR, f"_{clean_base_name}_character_pages.txt")
     try:
-        with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f)
+        with open(out_txt, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f, delimiter='\t')
             writer.writerow(["キャラ名", "セリフ数", "登場ページ"])
-            
             sorted_chars = sorted(char_to_pages.keys(), key=lambda x: char_to_count.get(x, 0), reverse=True)
-            
             for char_name in sorted_chars:
                 compressed_pages = compress_page_ranges(char_to_pages[char_name])
                 count = char_to_count.get(char_name, 0)
                 writer.writerow([char_name, count, compressed_pages])
-                
-        print(f"📝 キャラ別登場一覧CSVを出力しました: {out_csv}")
+        print(f"📝 キャラ別登場一覧TXT(タブ区切り)を出力しました: {out_txt}")
     except Exception as e:
         print(f"キャラ別登場一覧出力エラー: {e}")
 
 def export_to_pdf(target_pages=None):
     print("🔄 完成版PDFを出力中...")
     import io
+    
+    # [AI Constraint] 以下の global 変数の退避・上書きロジック（コンテキストスイッチ）は
+    # 既存のレンダリングパイプラインを使い回すための意図的なハックです。
+    # 引数渡しへのリファクタリングなど、AIによる構造の改変を固く禁じます。
     global h, w_orig, drawn_actions, page_idx
     
     new_name = f"{clean_base_name}(丸付け後).pdf"
@@ -2215,28 +2307,13 @@ def export_to_pdf(target_pages=None):
         base_img = cv2.cvtColor(base_img, cv2.COLOR_RGB2BGR)
         base_float = base_img.astype(np.float32)
         
-        folder_name = f"Page {i + 1}"
-        page_dir = os.path.join(OUTPUT_BASE, folder_name)
-        state_file = os.path.join(page_dir, "state.json")
-
         ph, pw = base_img.shape[:2]
-        h = ph
-        w_orig = pw
+        h, w_orig = ph, pw
 
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    state_data = json.load(f)
-                page_actions = state_data.get("drawn_actions", [])
-                drawn_actions = []
-                for act in page_actions:
-                    obj = Shape.from_dict(act)
-                    if obj: drawn_actions.append(obj)
-            except Exception as e:
-                print(f"  [WARN] state.json 読み込み失敗 Page {i+1}: {e}")
-                drawn_actions = []
-        else:
-            drawn_actions = []
+        # [AI Constraint] ディスクへのアクセスを廃止し、GLOBAL_MEMORYから直接読み込むことで整合性と速度を確保
+        mem = GLOBAL_MEMORY.get(i, {})
+        acts = _saved_actions if i == _saved_page_idx else mem.get("drawn_actions", [])
+        drawn_actions = copy.deepcopy(acts)
 
         mul_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
         render_boxes_to_layer(mul_layer)
@@ -2279,6 +2356,104 @@ def export_to_pdf(target_pages=None):
     except Exception as e:
         print(f"PDF保存エラー: {e}")
 
+def export_to_script_pdf(selected_char_names, target_pages=None):
+    print("🔄 キャラ別抜き台本を出力中...")
+    import io
+    global h, w_orig, drawn_actions, page_idx
+    
+    script_dir = os.path.join(EXPORT_DIR, "scripts")
+    os.makedirs(script_dir, exist_ok=True)
+    
+    char_to_count, char_to_pages = get_character_stats()
+    
+    # 元のグローバル状態（編集中の画面状態）を退避
+    _saved_h = h
+    _saved_w = w_orig
+    _saved_actions = drawn_actions
+    _saved_page_idx = page_idx
+
+    for char_name in selected_char_names:
+        if char_name not in char_to_pages: continue
+        
+        print(f"  > {char_name} の台本を生成中...")
+        out_pdf = fitz.open()
+        
+        for p_idx in range(len(doc)):
+            logical_num = p_idx - LOGICAL_PAGE_OFFSET + 1
+            if logical_num < 1 or logical_num > TOTAL_PAGES: continue
+            if target_pages is not None and logical_num not in target_pages: continue
+            
+            # メモリからそのページの情報を取得
+            mem = GLOBAL_MEMORY.get(p_idx, {})
+            acts = mem.get("drawn_actions", [])
+            
+            # そのページに該当キャラが含まれているかチェック
+            found = False
+            for a in acts:
+                # Shapeオブジェクトの属性または辞書のキーを安全に取得
+                cnames = getattr(a, "char_names", [getattr(a, "char_name", "")])
+                if char_name in cnames:
+                    found = True; break
+            
+            if found:
+                # 合成レンダリング処理 (export_to_pdf のロジックを流用)
+                page_idx = p_idx
+                page = doc[p_idx]
+                zoom = 1400 / page.rect.width
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                base_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+                base_img = cv2.cvtColor(base_img, cv2.COLOR_RGB2BGR)
+                base_float = base_img.astype(np.float32)
+                
+                ph, pw = base_img.shape[:2]
+                h, w_orig = ph, pw
+                # レンダリング関数が参照するグローバル変数を一時的にそのページの内容に差し替え
+                drawn_actions = copy.deepcopy(acts)
+
+                # 1. 乗算レイヤー（枠）
+                mul_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+                render_boxes_to_layer(mul_layer)
+                m_alpha = mul_layer[:, :, 3:4].astype(np.float32) / 255.0
+                m_rgb   = mul_layer[:, :, :3].astype(np.float32)
+                multiplied = (base_float * m_rgb / 255.0)
+                final_float = multiplied * m_alpha + base_float * (1.0 - m_alpha)
+
+                # 2. 通常レイヤー（発光・テキスト・番号）
+                std_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+                render_glow_to_layer(std_layer)
+                render_texts_to_layer(std_layer)
+                s_alpha = std_layer[:, :, 3:4].astype(np.float32) / 255.0
+                s_rgb   = std_layer[:, :, :3].astype(np.float32)
+                final_float = s_rgb * s_alpha + final_float * (1.0 - s_alpha)
+                
+                # PDF挿入用に変換
+                final_img_uint8 = final_float.astype(np.uint8)
+                final_rgb = cv2.cvtColor(final_img_uint8, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(final_rgb).convert("RGB")
+                
+                img_byte_arr = io.BytesIO()
+                pil_img.save(img_byte_arr, format='JPEG', quality=85)
+                img_bytes = img_byte_arr.getvalue()
+
+                rect = fitz.Rect(0, 0, page.rect.width, page.rect.height)
+                new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(rect, stream=img_bytes)
+
+        if len(out_pdf) > 0:
+            # 命名規則: 作品名__キャラ名.pdf
+            output_name = f"{clean_base_name}__{char_name}.pdf"
+            output_path = os.path.join(script_dir, output_name)
+            out_pdf.save(output_path)
+            print(f"    ✅ 保存: {os.path.basename(output_path)}")
+        out_pdf.close()
+        
+    # グローバル状態を復元（編集中だったページに戻す）
+    h = _saved_h
+    w_orig = _saved_w
+    drawn_actions = _saved_actions
+    page_idx = _saved_page_idx
+
 def export_to_psd_layers(target_pages=None):
     if PSDImage is None:
         print("[ERROR] psd-tools がインストールされていないためPSD出力できません。")
@@ -2312,18 +2487,10 @@ def export_to_psd_layers(target_pages=None):
         ph, pw = base_np.shape[:2]
         h, w_orig = ph, pw
 
-        # 2. 状態の復元
-        folder_name = f"Page {i + 1}"
-        state_file = os.path.join(OUTPUT_BASE, folder_name, "state.json")
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    state_data = json.load(f)
-                drawn_actions = [Shape.from_dict(act) for act in state_data.get("drawn_actions", []) if Shape.from_dict(act)]
-            except:
-                drawn_actions = []
-        else:
-            drawn_actions = []
+        # 2. 状態の復元 (GLOBAL_MEMORYから取得)
+        mem = GLOBAL_MEMORY.get(i, {})
+        acts = _saved_actions if i == _saved_page_idx else mem.get("drawn_actions", [])
+        drawn_actions = copy.deepcopy(acts)
 
         # 3. レイヤー画像の生成
         # a) 背景レイヤー (通常) - Pillow Image
@@ -2377,39 +2544,28 @@ cv2.setMouseCallback(WIN_NAME, mouse_callback)
 
 def init_global_memory():
     global GLOBAL_MEMORY
-    print("🔄 全ページのデータをメモリにキャッシュ中...")
-    for p in range(raw_total):
+    def _load_p(p):
         state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
         if os.path.exists(state_file):
             try:
                 with open(state_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     actions = [Shape.from_dict(a) for a in data.get("drawn_actions", [])]
-                    actions = [a for a in actions if a]
-                    GLOBAL_MEMORY[p] = {"drawn_actions": actions, "number_counter": data.get("number_counter", 1), "is_dirty": False}
+                    GLOBAL_MEMORY[p] = {"drawn_actions": [a for a in actions if a], "number_counter": data.get("number_counter", 1), "is_dirty": False}
             except: pass
         if p not in GLOBAL_MEMORY:
             GLOBAL_MEMORY[p] = {"drawn_actions": [], "number_counter": 1, "is_dirty": False}
-    print(f"✅ キャッシュ完了: {len(GLOBAL_MEMORY)} ページ")
 
-def scan_all_pages_for_first_appearances():
-    global global_char_first_page
-    global_char_first_page.clear()
-    for p in range(TOTAL_PAGES):
-        state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                for act in state.get("drawn_actions", []):
-                    cname = act.get("char_name")
-                    if cname and cname not in global_char_first_page:
-                        global_char_first_page[cname] = p
-            except Exception:
-                pass
+    _load_p(0) # 最初のページだけは画面表示のために即時ロード
+    
+    def _bg_init():
+        print("🔄 全ページデータをバックグラウンドでロード中...")
+        for p in range(1, raw_total): _load_p(p)
+        print(f"✅ キャッシュ完了: {len(GLOBAL_MEMORY)} ページ")
+        
+    threading.Thread(target=_bg_init, daemon=True).start()
 
 init_global_memory()
-scan_all_pages_for_first_appearances()
 load_page(0)
 
 # 初回起動時のウィンドウサイズ設定
@@ -2436,11 +2592,6 @@ while True:
     if cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1:
         save_current_page()
         break
-
-    if pending_page_load and (time.time() - last_scroll_time > 0.4):
-        load_page(page_idx)
-        pending_page_load = False
-        request_render()
 
     render()
     key = cv2.waitKey(30) & 0xFF
@@ -2474,6 +2625,9 @@ while True:
         pending_gui_action = None
     elif pending_gui_action == "add":
         run_add_char_dialog()
+        pending_gui_action = None
+    elif pending_gui_action == "page_jump":
+        run_page_jump_dialog()
         pending_gui_action = None
         
     if char_delete_mode and len(PALETTE) <= 1:
@@ -2598,11 +2752,11 @@ while True:
 cv2.destroyAllWindows()
 cv2.waitKey(1)
 
+# 終了時エクスポートフラグの処理（旧式の残骸クリーンアップ）
 if export_enabled:
+    # 実際には一括出力ダイアログ(KEY_TOGGLE_EXPORT)から実行するため、ここは念のための安全弁
     export_character_pages_csv()
     export_to_pdf()
-else:
-    print("⚠️ 終了時エクスポートはOFFのため、CSVとPDFは出力されませんでした。")
 
 try:
     doc.close()
