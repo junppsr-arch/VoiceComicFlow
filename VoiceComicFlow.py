@@ -2112,6 +2112,7 @@ def export_to_pdf():
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         base_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        base_img = cv2.cvtColor(base_img, cv2.COLOR_RGB2BGR)
         base_float = base_img.astype(np.float32)
         
         folder_name = f"Page {i + 1}"
