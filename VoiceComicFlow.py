@@ -1492,6 +1492,7 @@ def open_export_dialog():
     var_csv = tk.BooleanVar(dialog, value=True)
     var_psd_layers = tk.BooleanVar(dialog, value=False)
     var_extract = tk.BooleanVar(dialog, value=False)
+    page_range_var = tk.StringVar(dialog, value="")
     char_vars = {}
 
     main_frame = ttk.Frame(dialog, padding="20 20 20 20")
@@ -1501,6 +1502,11 @@ def open_export_dialog():
     ttk.Checkbutton(main_frame, text="完成版PDFを出力", variable=var_pdf).pack(anchor=tk.W, pady=2)
     ttk.Checkbutton(main_frame, text="登場一覧表(CSV)を出力", variable=var_csv).pack(anchor=tk.W, pady=2)
     ttk.Checkbutton(main_frame, text="レイヤー別PSDを出力 (GIMP等で編集可能)", variable=var_psd_layers).pack(anchor=tk.W, pady=2)
+    
+    page_frame = ttk.Frame(main_frame)
+    page_frame.pack(fill=tk.X, pady=(5, 0))
+    ttk.Label(page_frame, text="出力ページ指定 (例: 1, 3-5 / 空欄で全ページ):").pack(side=tk.LEFT)
+    ttk.Entry(page_frame, textvariable=page_range_var, width=15).pack(side=tk.LEFT, padx=5)
     
     ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
     ttk.Checkbutton(main_frame, text="キャラ別抜き台本(PDF)を出力 [未実装]", variable=var_extract, state=tk.DISABLED).pack(anchor=tk.W, pady=(0, 5))
@@ -1548,6 +1554,19 @@ def open_export_dialog():
     def run_export():
         dialog.attributes('-topmost', False)
         os.makedirs(EXPORT_DIR, exist_ok=True)
+        
+        target_pages = None
+        pr_str = page_range_var.get().strip()
+        if pr_str:
+            target_pages = set()
+            for part in pr_str.split(','):
+                part = part.strip()
+                if '-' in part:
+                    s, e = part.split('-')
+                    if s.isdigit() and e.isdigit(): target_pages.update(range(int(s), int(e)+1))
+                elif part.isdigit():
+                    target_pages.add(int(part))
+                    
         progress["value"] = 0
         total_tasks = int(var_pdf.get()) + int(var_csv.get()) + int(var_psd_layers.get())
         if total_tasks == 0:
@@ -1568,14 +1587,14 @@ def open_export_dialog():
             if var_pdf.get():
                 status_label.config(text="完成版PDFを出力中... (時間がかかります)")
                 dialog.update()
-                export_to_pdf()
+                export_to_pdf(target_pages)
                 current_task += 1
                 progress["value"] = current_task
                 
             if var_psd_layers.get():
                 status_label.config(text="レイヤー別PSDを出力中...")
                 dialog.update()
-                export_to_psd_layers()
+                export_to_psd_layers(target_pages)
                 current_task += 1
                 progress["value"] = current_task
 
@@ -2089,7 +2108,7 @@ def export_character_pages_csv():
     except Exception as e:
         print(f"キャラ別登場一覧出力エラー: {e}")
 
-def export_to_pdf():
+def export_to_pdf(target_pages=None):
     print("🔄 完成版PDFを出力中...")
     import io
     global h, w_orig, drawn_actions, page_idx
@@ -2106,6 +2125,8 @@ def export_to_pdf():
     start_idx = LOGICAL_PAGE_OFFSET
     end_idx = min(LOGICAL_PAGE_OFFSET + TOTAL_PAGES, len(doc))
     for i in range(start_idx, end_idx):
+        logical_num = i - LOGICAL_PAGE_OFFSET + 1
+        if target_pages is not None and logical_num not in target_pages: continue
         page_idx = i
         page = doc[i]
         zoom = 1400 / page.rect.width
@@ -2179,7 +2200,7 @@ def export_to_pdf():
     except Exception as e:
         print(f"PDF保存エラー: {e}")
 
-def export_to_psd_layers():
+def export_to_psd_layers(target_pages=None):
     if PSDImage is None:
         print("[ERROR] psd-tools がインストールされていないためPSD出力できません。")
         return
@@ -2199,6 +2220,8 @@ def export_to_psd_layers():
     end_idx = min(LOGICAL_PAGE_OFFSET + TOTAL_PAGES, len(doc))
 
     for i in range(start_idx, end_idx):
+        logical_num = i - LOGICAL_PAGE_OFFSET + 1
+        if target_pages is not None and logical_num not in target_pages: continue
         page_idx = i
         page = doc[i]
         
