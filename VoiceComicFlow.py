@@ -508,6 +508,7 @@ resizing_action = None
 resizing_part   = None
 drag_start_region = None
 add_new_y_range = (-1, -1)
+current_polyline = []  # 連結マーカーの座標キャッシュ
 
 
 
@@ -635,10 +636,15 @@ class Shape:
         elif stype == "gaya":
             obj = GayaShape(region, data.get("base_name", ""), data.get("num", 0), color, data.get("inverted", False))
             
-        # ★追加：どの図形であっても、char_nameを持っていれば一括で復元する
-        if obj and "char_name" in data:
-            obj.char_name = data["char_name"]
-            
+        # ★追加：どの図形であっても、付加情報を持っていれば一括で復元する
+        if obj:
+            if "char_name" in data:
+                obj.char_name = data["char_name"]
+            if "colors" in data:
+                obj.colors = [tuple(c) for c in data["colors"]]
+            if "char_names" in data:
+                obj.char_names = data["char_names"]
+                
         return obj
 
 class BoxShape(Shape):
@@ -683,7 +689,9 @@ class BoxShape(Shape):
         return {
             "type": "box", "region": self.region, "color": list(self.color),
             "shape": self.shape, "op": self.op, "group_id": self.group_id,
-            "char_name": getattr(self, "char_name", "")  # ★追加：キャラ名を保存
+            "char_name": getattr(self, "char_name", ""),
+            "colors": [list(c) for c in getattr(self, "colors", [self.color])],
+            "char_names": getattr(self, "char_names", [getattr(self, "char_name", "")])
         }
 
 class LineShape(Shape):
@@ -694,20 +702,23 @@ class LineShape(Shape):
     def draw(self, layer):
         if len(self.region) < 4: return
         l_color = (*self.color, LINE_ALPHA) if len(layer.shape) > 2 and layer.shape[2] == 4 else self.color
-        cv2.line(layer, (self.region[0], self.region[1]), (self.region[2], self.region[3]), l_color, LINE_THICKNESS, cv2.LINE_AA)
+        pts = np.array(self.region, np.int32).reshape((-1, 2))
+        cv2.polylines(layer, [pts], False, l_color, LINE_THICKNESS, cv2.LINE_AA)
 
     def check_hover(self, mx, my):
         if len(self.region) < 4: return None, None
-        x1, y1, x2, y2 = self.region
+        pts = np.array(self.region, np.int32).reshape((-1, 2))
         margin = HANDLE_MARGIN
-        if abs(mx - x1) < margin and abs(my - y1) < margin: return self, 'line_p1'
-        if abs(mx - x2) < margin and abs(my - y2) < margin: return self, 'line_p2'
-        px, py = x2 - x1, y2 - y1
-        l2 = px*px + py*py
-        if l2 > 0:
-            t = max(0, min(1, ((mx - x1)*px + (my - y1)*py) / l2))
-            if math.hypot(mx - (x1 + t * px), my - (y1 + t * py)) < margin:
-                return self, 'center'
+        if math.hypot(mx - pts[0][0], my - pts[0][1]) < margin: return self, 'line_p1'
+        if math.hypot(mx - pts[-1][0], my - pts[-1][1]) < margin: return self, 'line_p2'
+        for i in range(len(pts) - 1):
+            x1, y1, x2, y2 = pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]
+            px, py = x2 - x1, y2 - y1
+            l2 = px*px + py*py
+            if l2 > 0:
+                t = max(0, min(1, ((mx - x1)*px + (my - y1)*py) / l2))
+                if math.hypot(mx - (x1 + t * px), my - (y1 + t * py)) < margin:
+                    return self, 'center'
         return None, None
 
     def to_dict(self):
@@ -1057,8 +1068,8 @@ def render_boxes_to_layer(target_layer):
     lines = [sh for sh in drawn_actions if isinstance(sh, LineShape)]
     for line in lines:
         if len(line.region) < 4: continue
-        lx1, ly1, lx2, ly2 = line.region
-        cv2.line(line_mask, (lx1, ly1), (lx2, ly2), 255, LINE_THICKNESS + LINE_ERASE_GAP * 2, cv2.LINE_AA)
+        pts = np.array(line.region, np.int32).reshape((-1, 2))
+        cv2.polylines(line_mask, [pts], False, 255, LINE_THICKNESS + LINE_ERASE_GAP * 2, cv2.LINE_AA)
 
     group_order = []
     group_boxes = {}
@@ -1075,21 +1086,44 @@ def render_boxes_to_layer(target_layer):
 
     for gid in group_order:
         g_actions = group_boxes[gid]
-        color = (*g_actions[0].color, BOX_ALPHA)
+        base_act = g_actions[0]
+        colors = getattr(base_act, 'colors', [base_act.color])
+        alpha_val = BOX_ALPHA
+        
         shape_mask = np.zeros((h, w_orig), dtype=np.uint8)
         for act in g_actions:
             fill_val = 255 if act.op == "add" else 0
             act.draw(shape_mask, thickness=-1, color_override=fill_val)
-
         contours, _ = cv2.findContours(shape_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        g_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-        cv2.drawContours(g_layer, contours, -1, color, BOX_THICKNESS, cv2.LINE_AA)
 
-        g_layer[line_mask > 0] = 0
+        g_layer_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        if len(contours) > 0:
+            x, y, w_box, h_box = cv2.boundingRect(np.vstack(contours))
+            cx, cy = x + w_box / 2.0, y + h_box / 2.0
+            radius = max(w_box, h_box) * 1.5
+            N = len(colors)
+            
+            for i, c in enumerate(colors):
+                c_bgra = (*c, alpha_val)
+                temp_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
+                cv2.drawContours(temp_layer, contours, -1, c_bgra, BOX_THICKNESS, cv2.LINE_AA)
+                
+                if N > 1:
+                    start_angle = (i * 360.0 / N) - 90
+                    end_angle = ((i + 1) * 360.0 / N) - 90
+                    wedge_mask = np.zeros((h, w_orig), dtype=np.uint8)
+                    cv2.ellipse(wedge_mask, (int(cx), int(cy)), (int(radius), int(radius)), 0, start_angle, end_angle, 255, -1)
+                    mask = (temp_layer[:, :, 3] > 0) & (wedge_mask > 0)
+                    g_layer_combined[mask] = temp_layer[mask]
+                else:
+                    mask = temp_layer[:, :, 3] > 0
+                    g_layer_combined[mask] = temp_layer[mask]
+
+        g_layer_combined[line_mask > 0] = 0
 
         erase_mask = cv2.dilate(shape_mask, kernel, iterations=1)
         final_layer[erase_mask > 0] = 0
-        final_layer = cv2.add(final_layer, g_layer)
+        final_layer = cv2.add(final_layer, g_layer_combined)
 
     for line in lines:
         line.draw(final_layer)
@@ -1107,8 +1141,8 @@ def render_glow_to_layer(std_layer):
     lines = [sh for sh in drawn_actions if isinstance(sh, LineShape)]
     for line in lines:
         if len(line.region) < 4: continue
-        lx1, ly1, lx2, ly2 = line.region
-        cv2.line(line_mask, (lx1, ly1), (lx2, ly2), 255, LINE_THICKNESS + LINE_ERASE_GAP * 2, cv2.LINE_AA)
+        pts = np.array(line.region, np.int32).reshape((-1, 2))
+        cv2.polylines(line_mask, [pts], False, 255, LINE_THICKNESS + LINE_ERASE_GAP * 2, cv2.LINE_AA)
 
     group_order = []
     group_boxes = {}
@@ -1125,26 +1159,49 @@ def render_glow_to_layer(std_layer):
 
     for gid in group_order:
         g_actions = group_boxes[gid]
-        color = (*g_actions[0].color, GLOW_ALPHA)
+        base_act = g_actions[0]
+        colors = getattr(base_act, 'colors', [base_act.color])
+        alpha_val = GLOW_ALPHA
+        
         shape_mask = np.zeros((h, w_orig), dtype=np.uint8)
         for act in g_actions:
             fill_val = 255 if act.op == "add" else 0
             act.draw(shape_mask, thickness=-1, color_override=fill_val)
-
         contours, _ = cv2.findContours(shape_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        g_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-        cv2.drawContours(g_layer, contours, -1, color, BOX_THICKNESS, cv2.LINE_AA)
 
-        g_layer[line_mask > 0] = 0
+        g_layer_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        if len(contours) > 0:
+            x, y, w_box, h_box = cv2.boundingRect(np.vstack(contours))
+            cx, cy = x + w_box / 2.0, y + h_box / 2.0
+            radius = max(w_box, h_box) * 1.5
+            N = len(colors)
+            
+            for i, c in enumerate(colors):
+                c_bgra = (*c, alpha_val)
+                temp_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
+                cv2.drawContours(temp_layer, contours, -1, c_bgra, BOX_THICKNESS, cv2.LINE_AA)
+                
+                if N > 1:
+                    start_angle = (i * 360.0 / N) - 90
+                    end_angle = ((i + 1) * 360.0 / N) - 90
+                    wedge_mask = np.zeros((h, w_orig), dtype=np.uint8)
+                    cv2.ellipse(wedge_mask, (int(cx), int(cy)), (int(radius), int(radius)), 0, start_angle, end_angle, 255, -1)
+                    mask = (temp_layer[:, :, 3] > 0) & (wedge_mask > 0)
+                    g_layer_combined[mask] = temp_layer[mask]
+                else:
+                    mask = temp_layer[:, :, 3] > 0
+                    g_layer_combined[mask] = temp_layer[mask]
+
+        g_layer_combined[line_mask > 0] = 0
 
         erase_mask = cv2.dilate(shape_mask, kernel, iterations=1)
         final_glow[erase_mask > 0] = 0
-        final_glow = cv2.add(final_glow, g_layer)
+        final_glow = cv2.add(final_glow, g_layer_combined)
 
     for line in lines:
         if len(line.region) < 4: continue
-        lx1, ly1, lx2, ly2 = line.region
-        cv2.line(final_glow, (lx1, ly1), (lx2, ly2), (*line.color, GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
+        pts = np.array(line.region, np.int32).reshape((-1, 2))
+        cv2.polylines(final_glow, [pts], False, (*line.color, GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
 
     for action in drawn_actions:
         if isinstance(action, EraserShape):
@@ -1309,7 +1366,8 @@ def render():
                     nx, ny = r_region[0], r_region[1]
                     cv2.rectangle(display_out, (int(nx)-20, int(ny)-20), (int(nx)+20, int(ny)+20), (255,255,255), 2)
                 elif r_type == "line" and len(r_region) >= 4:
-                    cv2.line(display_out, (int(r_region[0]), int(r_region[1])), (int(r_region[2]), int(r_region[3])), r_color, 2, cv2.LINE_AA)
+                    pts_arr = np.array(r_region, np.int32).reshape((-1, 2))
+                    cv2.polylines(display_out, [pts_arr], False, r_color, 2, cv2.LINE_AA)
                 elif r_type == "eraser" and len(r_region) >= 2:
                     ex, ey = r_region[0], r_region[1]
                     r = r_region[2] if len(r_region) >= 3 else ERASER_RADIUS
@@ -1348,6 +1406,10 @@ def render():
                         else:
                             cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
         else:
+            if mode == "line" and current_polyline:
+                pts = np.array(current_polyline, np.int32).reshape((-1, 1, 2))
+                cv2.polylines(display_out, [pts], False, current_color, 2, cv2.LINE_AA)
+
             ha, part = get_hovered_handle(mouseX, mouseY)
             if ha and not alt_pressed:
                 s_type = ha.shape_type if not isinstance(ha, dict) else ha.get("type", "box")
@@ -1362,11 +1424,13 @@ def render():
                     e_color = (0, 0, 255) if part == 'edge' else (255, 255, 0)
                     cv2.circle(display_out, (int(ex+r), int(ey)), 8, e_color, -1)
                 elif s_type == "line" and len(region) >= 4:
-                    ex1, ey1, ex2, ey2 = region
-                    cv2.line(display_out, (ex1, ey1), (ex2, ey2), (0, 255, 0), 1)
-                    cx, cy = (ex1+ex2)//2, (ey1+ey2)//2
-                    pts = {'line_p1': (ex1, ey1), 'line_p2': (ex2, ey2), 'center': (cx, cy)}
-                    for p_name, (ptx, pty) in pts.items():
+                    pts_arr = np.array(region, np.int32).reshape((-1, 2))
+                    cv2.polylines(display_out, [pts_arr], False, (0, 255, 0), 1)
+                    
+                    p1 = tuple(pts_arr[0])
+                    p2 = tuple(pts_arr[-1])
+                    pts_dict = {'line_p1': p1, 'line_p2': p2}
+                    for p_name, (ptx, pty) in pts_dict.items():
                         c = (0, 0, 255) if part == p_name else (255, 255, 0)
                         cv2.rectangle(display_out, (ptx-HANDLE_DRAW_SIZE, pty-HANDLE_DRAW_SIZE), (ptx+HANDLE_DRAW_SIZE, pty+HANDLE_DRAW_SIZE), c, -1)
                 elif s_type == "box" and len(region) >= 4:
@@ -1663,14 +1727,25 @@ def handle_hud_click(mx, my, flags):
 def run_color_chooser(idx):
     global current_color
     b, g, r = PALETTE[idx]["color"]
-    init_hex = f"#{r:02x}{g:02x}{b:02x}"
-    color_code = colorchooser.askcolor(title=f"{PALETTE[idx]['name']} の色を選択", initialcolor=init_hex, parent=_root)
-    if color_code[0] is not None:
-        r_new, g_new, b_new = map(int, color_code[0])
-        PALETTE[idx]["color"] = (b_new, g_new, r_new)
-        if idx == current_palette_idx: current_color = PALETTE[idx]["color"]
-        save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
-        request_render()
+    init_hex = f"{r:02x}{g:02x}{b:02x}".upper()
+    
+    root = tk.Tk()
+    root.withdraw()
+    new_hex = simpledialog.askstring("色設定", f"{PALETTE[idx]['name']} の色コードを入力 (例: EE99FF):", initialvalue=init_hex, parent=_root)
+    root.destroy()
+    
+    if new_hex:
+        new_hex = new_hex.lstrip('#').strip()
+        if len(new_hex) == 6 and all(c in "0123456789ABCDEFabcdef" for c in new_hex):
+            rgb = tuple(int(new_hex[i:i+2], 16) for i in (0, 2, 4))
+            # BGR形式で保存
+            PALETTE[idx]["color"] = (rgb[2], rgb[1], rgb[0])
+            if idx == current_palette_idx: 
+                current_color = PALETTE[idx]["color"]
+            save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
+            request_render()
+        else:
+            messagebox.showerror("エラー", "無効なカラーコードです。6桁の16進数(例: FF809D)で入力してください。")
 
 def run_add_char_dialog():
     dlg = tk.Toplevel(_root); dlg.title("キャラ一括追加"); dlg.geometry("400x450"); dlg.attributes('-topmost', True)
@@ -1735,7 +1810,36 @@ def mouse_callback(event, x, y, flags, param):
     if ix >= w_orig and dragging:
         ix = w_orig - 1
 
+    # ▼ 右クリック処理（連結マーカー / マルチカラー追加）
+    if event == cv2.EVENT_RBUTTONDOWN and ix < w_orig:
+        if mode == "line":
+            if not current_polyline: current_polyline.append((ix, iy))
+            current_polyline.append((ix, iy))
+            request_render()
+        elif mode == "color":
+            ha, _ = get_hovered_handle(ix, iy, flags)
+            if isinstance(ha, BoxShape):
+                save_undo_state()
+                if not hasattr(ha, 'colors'): ha.colors = [ha.color]
+                if not hasattr(ha, 'char_names'): ha.char_names = [getattr(ha, 'char_name', '')]
+                if current_color not in ha.colors:
+                    ha.colors.append(current_color)
+                    ha.char_names.append(current_name)
+                request_render()
+
     if event == cv2.EVENT_LBUTTONDOWN and ix < w_orig:
+        # ▼ 左クリックで連結マーカーを確定
+        if mode == "line" and current_polyline:
+            current_polyline[-1] = (ix, iy)
+            save_undo_state()
+            flat_pts = [coord for pt in current_polyline for coord in pt]
+            new_line = LineShape(flat_pts, current_color)
+            new_line.char_name = current_name
+            drawn_actions.append(new_line)
+            current_polyline.clear()
+            request_render()
+            return
+
         if mode == "delete":
             target_action = get_deletable_action(ix, iy)
             if target_action:
@@ -1779,6 +1883,10 @@ def mouse_callback(event, x, y, flags, param):
             return
 
     elif event == cv2.EVENT_MOUSEMOVE:
+        if mode == "line" and current_polyline:
+            current_polyline[-1] = (ix, iy)
+            render()
+
         if dragging and ix < w_orig:
             drag_end = (ix, iy)
             if mode == "eraser" and not resizing_action:
@@ -2062,19 +2170,23 @@ def export_character_pages_csv():
                 processed_groups = set()
 
                 for act in state.get("drawn_actions", []):
-                    cname = act.get("char_name")
-                    if not cname: continue
-                    
-                    page_chars.add(cname)
+                    # BoxShapeが保持する複数キャラ名(char_names)を優先取得
+                    cnames = act.get("char_names", [act.get("char_name")])
                     t = act.get("type")
+                    gid = act.get("group_id", 0)
                     
-                    if t == "box":
-                        gid = act.get("group_id", 0)
-                        if gid not in processed_groups:
+                    for cname in cnames:
+                        if not cname: continue
+                        page_chars.add(cname)
+                        
+                        if t == "box":
+                            # グループ+キャラ名の複合キーで重複カウントを防止
+                            unique_gid = f"{gid}_{cname}"
+                            if unique_gid not in processed_groups:
+                                char_to_count[cname] = char_to_count.get(cname, 0) + 1
+                                processed_groups.add(unique_gid)
+                        elif t == "line":
                             char_to_count[cname] = char_to_count.get(cname, 0) + 1
-                            processed_groups.add(gid)
-                    elif t == "line":
-                        char_to_count[cname] = char_to_count.get(cname, 0) + 1
                         
             except Exception:
                 pass
