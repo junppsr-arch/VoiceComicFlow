@@ -474,12 +474,19 @@ next_group_id  = 1
 global_char_first_page = {}
 show_help      = False
 PAGE_CACHE     = {}   # {page_idx: (img_bgr, h, w_orig)}
+GLOBAL_MEMORY  = {}   # {page_idx: {"drawn_actions": [], "number_counter": 1, "is_dirty": False}}
+PAGE_IS_DIRTY  = False
 shift_pressed  = False
 
 def save_undo_state():
-    global undo_stack, redo_stack
+    global undo_stack, redo_stack, PAGE_IS_DIRTY
     undo_stack.append((copy.deepcopy(drawn_actions), number_counter))
     redo_stack.clear()
+    PAGE_IS_DIRTY = True
+
+def mark_dirty():
+    global PAGE_IS_DIRTY
+    PAGE_IS_DIRTY = True
 
 # キャッシュレンダリング用
 cached_canvas  = None
@@ -535,27 +542,15 @@ def load_page(idx: int):
     # バックグラウンド先読み開始
     threading.Thread(target=prefetch_pages, args=(idx,), daemon=True).start()
     
-    # JSONから状態を復元
-    global undo_stack
-    folder_name = f"Page {idx + 1}"
-    state_file = os.path.join(OUTPUT_BASE, folder_name, "state.json")
-    drawn_actions = []
-    undo_stack = []   # ← 追加：ページ遷移時にUndo履歴を確実に消去
+    # メモリから状態を爆速復元
+    global undo_stack, redo_stack, PAGE_IS_DIRTY
+    undo_stack = []
     redo_stack = []
-    number_counter = 1
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            drawn_actions_loaded = state.get("drawn_actions", [])
-            drawn_actions = []
-            for act in drawn_actions_loaded:
-                obj = Shape.from_dict(act)
-                if obj: drawn_actions.append(obj)
-            number_counter = state.get("number_counter", 1)
-            print(f"🔄 ページ {idx + 1} の状態を復元しました (actions: {len(drawn_actions)})")
-        except Exception as e:
-            print(f"状態の復元に失敗しました: {e}")
+    
+    mem = GLOBAL_MEMORY.get(idx, {"drawn_actions": [], "number_counter": 1})
+    drawn_actions = copy.deepcopy(mem.get("drawn_actions", []))
+    number_counter = mem.get("number_counter", 1)
+    PAGE_IS_DIRTY = False
 
     next_group_id = 1
     if drawn_actions:
@@ -568,6 +563,7 @@ def load_page(idx: int):
 
     def _run_yolo(frame, p_idx):
         global bboxes, yolo_running
+        time.sleep(0.4)  # UI描画と操作を最優先するため、YOLO起動を意図的に遅延
         if not yolo_enabled:
             with yolo_lock:
                 bboxes = []
@@ -1012,52 +1008,30 @@ def check_and_add_text_action(region, char_name, color):
         drawn_actions.append(TextShape([tx1, ty1, tx1 + tw, ty1 + th], char_name, color))
 
 def get_next_gaya_number(base_name):
-    """
-    現在のページと全保存済みページの中にある同じbase_nameを持つGayaShapeの最大num+1を返す
-    """
     max_num = 0
-    # 1. メモリ上の現在のページ
-    for act in drawn_actions:
-        if isinstance(act, GayaShape) and act.base_name == base_name:
-            max_num = max(max_num, act.num)
-    
-    # 2. ファイルに保存された全ページ
-    for p in range(len(doc)):
-        if p == page_idx: continue
-        folder_name = f"Page {p + 1}"
-        state_file = os.path.join(OUTPUT_BASE, folder_name, "state.json")
-        if os.path.exists(state_file):
-            try:
-                with open(state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for ad in data.get("drawn_actions", []):
-                    if ad.get("type") == "gaya" and ad.get("base_name") == base_name:
-                        max_num = max(max_num, ad.get("num", 0))
-            except: pass
+    for p, mem in GLOBAL_MEMORY.items():
+        acts = drawn_actions if p == page_idx else mem.get("drawn_actions", [])
+        for act in acts:
+            if getattr(act, "shape_type", "") == "gaya" and getattr(act, "base_name", "") == base_name:
+                max_num = max(max_num, act.num)
     return max_num + 1
 
 def recalculate_gaya_numbers():
-    """現在のページ内のガヤ連番を詰め直す（他ページ依存を考慮）"""
-    gaya_dict = {}
-    for act in drawn_actions:
-        if isinstance(act, GayaShape):
-            gaya_dict.setdefault(act.base_name, []).append(act)
-    
-    for base_name, shapes in gaya_dict.items():
-        base_num = 0
-        for p in range(len(doc)):
-            if p == page_idx: continue
-            state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
-            if os.path.exists(state_file):
-                try:
-                    with open(state_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    for ad in data.get("drawn_actions", []):
-                        if ad.get("type") == "gaya" and ad.get("base_name") == base_name:
-                            base_num = max(base_num, ad.get("num", 0))
-                except: pass
-        for i, act in enumerate(shapes):
-            act.num = base_num + 1 + i
+    # [AI Constraint] 全ページを走査し、Page 1から順にガヤ連番を振り直す（無限増殖バグの完全防止）
+    counters = {}
+    for p in range(TOTAL_PAGES):
+        acts = drawn_actions if p == page_idx else GLOBAL_MEMORY.get(p, {}).get("drawn_actions", [])
+        changed = False
+        for act in acts:
+            if getattr(act, "shape_type", "") == "gaya":
+                bn = act.base_name
+                counters[bn] = counters.get(bn, 0) + 1
+                if act.num != counters[bn]:
+                    act.num = counters[bn]
+                    changed = True
+        if changed and p != page_idx:
+            GLOBAL_MEMORY[p]["is_dirty"] = True
+            _async_save_bg(p, acts, GLOBAL_MEMORY[p].get("number_counter", 1))
 
 
 # ─────────────────────────────────────────
@@ -2100,28 +2074,27 @@ def _make_serializable(obj):
     elif isinstance(obj, dict): return {k: _make_serializable(v) for k, v in obj.items()}
     return obj
 
-def save_current_page():
-    if img is None: return
-
-    used_chars = set(getattr(a, "char_name", None) for a in drawn_actions if getattr(a, "char_name", None))
-    page_records[page_idx] = used_chars
-
-    folder_name = f"Page {page_idx + 1}"
-    out_dir = os.path.join(OUTPUT_BASE, folder_name)
+def _async_save_bg(p_idx, actions, n_cnt):
+    used_chars = set(getattr(a, "char_name", None) for a in actions if getattr(a, "char_name", None))
+    page_records[p_idx] = used_chars
+    out_dir = os.path.join(OUTPUT_BASE, f"Page {p_idx + 1}")
     os.makedirs(out_dir, exist_ok=True)
-
-    state = {
-        "number_counter": number_counter,
-        "drawn_actions": _make_serializable(drawn_actions)
-    }
-    state_file = os.path.join(out_dir, "state.json")
     try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"JSON保存エラー: {e}")
+        with open(os.path.join(out_dir, "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"number_counter": n_cnt, "drawn_actions": _make_serializable(actions)}, f, ensure_ascii=False, indent=2)
+    except: pass
 
-    print(f"✅ 状態保存完了: {folder_name} (キャラ: {', '.join(used_chars)})")
+def save_current_page():
+    global PAGE_IS_DIRTY
+    if img is None or not PAGE_IS_DIRTY: return
+
+    GLOBAL_MEMORY[page_idx] = {
+        "drawn_actions": copy.deepcopy(drawn_actions),
+        "number_counter": number_counter,
+        "is_dirty": False
+    }
+    threading.Thread(target=_async_save_bg, args=(page_idx, drawn_actions, number_counter), daemon=True).start()
+    PAGE_IS_DIRTY = False
 
 
 def compress_page_ranges(page_labels):
@@ -2402,6 +2375,23 @@ def export_to_psd_layers(target_pages=None):
 cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
 cv2.setMouseCallback(WIN_NAME, mouse_callback)
 
+def init_global_memory():
+    global GLOBAL_MEMORY
+    print("🔄 全ページのデータをメモリにキャッシュ中...")
+    for p in range(raw_total):
+        state_file = os.path.join(OUTPUT_BASE, f"Page {p + 1}", "state.json")
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    actions = [Shape.from_dict(a) for a in data.get("drawn_actions", [])]
+                    actions = [a for a in actions if a]
+                    GLOBAL_MEMORY[p] = {"drawn_actions": actions, "number_counter": data.get("number_counter", 1), "is_dirty": False}
+            except: pass
+        if p not in GLOBAL_MEMORY:
+            GLOBAL_MEMORY[p] = {"drawn_actions": [], "number_counter": 1, "is_dirty": False}
+    print(f"✅ キャッシュ完了: {len(GLOBAL_MEMORY)} ページ")
+
 def scan_all_pages_for_first_appearances():
     global global_char_first_page
     global_char_first_page.clear()
@@ -2418,6 +2408,7 @@ def scan_all_pages_for_first_appearances():
             except Exception:
                 pass
 
+init_global_memory()
 scan_all_pages_for_first_appearances()
 load_page(0)
 
