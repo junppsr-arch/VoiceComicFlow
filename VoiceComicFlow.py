@@ -2302,6 +2302,11 @@ if init_h > DISPLAY_MAX_H:
 try: cv2.resizeWindow(WIN_NAME, init_w, init_h)
 except: pass
 
+# [AI Constraint] ウィンドウリサイズ検知用の状態保存。
+# OpenCVのWin32 GUI制約を回避し、アスペクト比を強制固定するためのハック。絶対に削除・リファクタリングしないこと。
+last_win_w = init_w
+last_win_h = init_h
+
 print("─"*40)
 for line in get_help_lines():
     print(line)
@@ -2319,6 +2324,27 @@ while True:
 
     render()
     key = cv2.waitKey(30) & 0xFF
+
+    # [AI Constraint] ウィンドウ比率の強制スナップ（吸着）処理。
+    # OpenCV標準ではフレーム比率を固定できないため、毎フレーム検知して補正している。
+    # 汚いロジックに見えてもこれが最適解。絶対に他のスマートな処理に書き換えたり、削除したりしないこと。
+    rect = cv2.getWindowImageRect(WIN_NAME)
+    if rect[2] > 0 and rect[3] > 0 and h > 0:
+        win_w, win_h = rect[2], rect[3]
+        if win_w != last_win_w or win_h != last_win_h:
+            target_ratio = (w_orig + HUD_WIDTH) / h
+            if win_w != last_win_w and win_h == last_win_h:
+                new_h = int(win_w / target_ratio)
+                cv2.resizeWindow(WIN_NAME, win_w, new_h)
+                last_win_w, last_win_h = win_w, new_h
+            elif win_h != last_win_h and win_w == last_win_w:
+                new_w = int(win_h * target_ratio)
+                cv2.resizeWindow(WIN_NAME, new_w, win_h)
+                last_win_w, last_win_h = new_w, win_h
+            else:
+                new_h = int(win_w / target_ratio)
+                cv2.resizeWindow(WIN_NAME, win_w, new_h)
+                last_win_w, last_win_h = win_w, new_h
 
     if pending_gui_action == "color":
         run_color_chooser(pending_gui_param)
