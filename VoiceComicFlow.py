@@ -29,8 +29,8 @@ import tkinter as tk
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import simpledialog
-from tkinter import colorchooser
 from tkinter import ttk
+# [AI Constraint] colorchooser は HEX 手動入力に移行したため削除済み
 
 # [AI Constraint] 起動速度を最速にするため、重いライブラリのロード前にPDF選択ダイアログを出す
 _root = tk.Tk()
@@ -223,38 +223,49 @@ def get_help_lines():
     ]
 
 # ─────────────────────────────────────────
-# フォント読み込み (日本語テロップ用)
+# フォント読み込み (クロスプラットフォーム対応)
 # ─────────────────────────────────────────
 FONT_BBOX_CACHE = {} # {text: bbox_Size}
+
+def get_sys_font_path():
+    import platform
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        paths = ["C:/Windows/Fonts/msgothic.ttc", "C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc"]
+    elif sys_name == "Darwin": # Mac
+        paths = ["/System/Library/Fonts/Hiragino Sans W4.ttc", "/Library/Fonts/Osaka.ttf"]
+    else: # Linux
+        paths = ["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf"]
+    for p in paths:
+        if os.path.exists(p): return p
+    return None
+
+SYS_FONT_PATH = get_sys_font_path()
+
 try:
-    JP_FONT = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", TEXT_SIZE)
-    NUM_FONT = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", NUMBER_SIZE)
-    PAGE_FONT = ImageFont.truetype("C:/Windows/Fonts/msgothic.ttc", PAGE_TEXT_SIZE)
+    if SYS_FONT_PATH:
+        JP_FONT = ImageFont.truetype(SYS_FONT_PATH, TEXT_SIZE)
+        NUM_FONT = ImageFont.truetype(SYS_FONT_PATH, NUMBER_SIZE)
+        PAGE_FONT = ImageFont.truetype(SYS_FONT_PATH, PAGE_TEXT_SIZE)
+    else:
+        raise IOError
 except IOError:
-    try:
-        JP_FONT = ImageFont.truetype("C:/Windows/Fonts/meiryo.ttc", TEXT_SIZE)
-        NUM_FONT = ImageFont.truetype("C:/Windows/Fonts/meiryo.ttc", NUMBER_SIZE)
-        PAGE_FONT = ImageFont.truetype("C:/Windows/Fonts/meiryo.ttc", PAGE_TEXT_SIZE)
-    except IOError:
-        print("[WARNING] 日本語フォントが見つからないためデフォルトフォントを使用します")
-        JP_FONT = ImageFont.load_default()
-        NUM_FONT = ImageFont.load_default()
-        PAGE_FONT = ImageFont.load_default()
+    print("[WARNING] 日本語フォントが見つからないためデフォルトを使用します")
+    JP_FONT = ImageFont.load_default()
+    NUM_FONT = ImageFont.load_default()
+    PAGE_FONT = ImageFont.load_default()
 
 DYNAMIC_FONT_CACHE = {}
 
 def get_dynamic_font(size):
     global DYNAMIC_FONT_CACHE
-    path = "C:/Windows/Fonts/msgothic.ttc"
-    key = (path, size)
+    key = (SYS_FONT_PATH, size)
     if key not in DYNAMIC_FONT_CACHE:
         try:
-            DYNAMIC_FONT_CACHE[key] = ImageFont.truetype(path, size)
+            if SYS_FONT_PATH: DYNAMIC_FONT_CACHE[key] = ImageFont.truetype(SYS_FONT_PATH, size)
+            else: raise IOError
         except:
-            try:
-                DYNAMIC_FONT_CACHE[key] = ImageFont.truetype("C:/Windows/Fonts/meiryo.ttc", size)
-            except:
-                DYNAMIC_FONT_CACHE[key] = ImageFont.load_default()
+            DYNAMIC_FONT_CACHE[key] = ImageFont.load_default()
     return DYNAMIC_FONT_CACHE[key]
 
 HELP_OVERLAY_CACHE = None
@@ -485,9 +496,28 @@ model = None
 
 def _bg_load_yolo():
     global model
-    try: model = YOLO(yolo_path)
-    except: pass
+    if os.path.exists(yolo_path):
+        try: model = YOLO(yolo_path)
+        except: pass
 threading.Thread(target=_bg_load_yolo, daemon=True).start()
+
+def download_and_load_yolo():
+    global model, yolo_running
+    yolo_running = True
+    request_render()
+    try:
+        if not os.path.exists(yolo_path):
+            import urllib.request
+            print("⏳ YOLOv8n(AIモデル)をダウンロード中...")
+            urllib.request.urlretrieve("https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt", yolo_path)
+        model = YOLO(yolo_path)
+        print("✅ YOLOロード完了")
+    except Exception as e:
+        print(f"❌ YOLOロード失敗: {e}")
+    finally:
+        with yolo_lock:
+            yolo_running = False
+        request_render()
 
 # グローバル状態
 alt_pressed    = False
@@ -541,7 +571,7 @@ if not PALETTE:
     save_project_palette(PALETTE, proj_csv_path)
 
 current_palette_idx = 0
-current_color = PALETTE[0]["color"]
+current_color_bgr = PALETTE[0]["color"]
 current_name  = PALETTE[0]["name"]
 
 dragging       = False
@@ -638,9 +668,9 @@ class Shape:
     """
     共通インターフェースおよびファクトリメソッドを提供する基底クラス
     """
-    def __init__(self, region, color=None, group_id=0):
+    def __init__(self, region, color_bgr=None, group_id=0):
         self.region = list(region)
-        self.color = color if color is None else tuple(color)
+        self.color_bgr = color_bgr if color_bgr is None else tuple(color_bgr)
         self.group_id = group_id
         self.shape_type = "base"
 
@@ -657,24 +687,24 @@ class Shape:
     def from_dict(cls, data):
         stype = data.get("type")
         region = data.get("region", [])
-        color = data.get("color")
+        color_bgr = data.get("color")
         group_id = data.get("group_id", 0)
 
         obj = None
         if stype == "box":
-            obj = BoxShape(region, color, data.get("shape", "rect"), data.get("op", "add"), group_id)
+            obj = BoxShape(region, color_bgr, data.get("shape", "rect"), data.get("op", "add"), group_id)
         elif stype == "line":
-            obj = LineShape(region, color, group_id)
+            obj = LineShape(region, color_bgr, group_id)
         elif stype == "text":
-            obj = TextShape(region, data.get("char_name", ""), color)
+            obj = TextShape(region, data.get("char_name", ""), color_bgr)
         elif stype == "number":
             obj = NumberShape(region, data.get("num", 0), group_id)
         elif stype == "manual_text":
-            obj = ManualTextShape(region, data.get("text", ""), data.get("font_size", MANUAL_TEXT_SIZE), color)
+            obj = ManualTextShape(region, data.get("text", ""), data.get("font_size", MANUAL_TEXT_SIZE), color_bgr)
         elif stype == "eraser":
             obj = EraserShape(region)
         elif stype == "gaya":
-            obj = GayaShape(region, data.get("base_name", ""), data.get("num", 0), color, data.get("inverted", False))
+            obj = GayaShape(region, data.get("base_name", ""), data.get("num", 0), color_bgr, data.get("inverted", False))
             
         # ★追加：どの図形であっても、付加情報を持っていれば一括で復元する
         if obj:
@@ -688,8 +718,8 @@ class Shape:
         return obj
 
 class BoxShape(Shape):
-    def __init__(self, region, color, shape="rect", op="add", group_id=0):
-        super().__init__(region, color, group_id)
+    def __init__(self, region, color_bgr, shape="rect", op="add", group_id=0):
+        super().__init__(region, color_bgr, group_id)
         self.shape = shape
         self.op = op
         self.shape_type = "box"
@@ -698,7 +728,7 @@ class BoxShape(Shape):
         if len(self.region) < 4: return
         x1, y1, x2, y2 = self.region
         draw_thick = thickness if thickness is not None else BOX_THICKNESS
-        draw_color = color_override if color_override is not None else self.color
+        draw_color = color_override if color_override is not None else self.color_bgr
         
         if self.shape == "ellipse":
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -727,21 +757,21 @@ class BoxShape(Shape):
 
     def to_dict(self):
         return {
-            "type": "box", "region": self.region, "color": list(self.color),
+            "type": "box", "region": self.region, "color": list(self.color_bgr),
             "shape": self.shape, "op": self.op, "group_id": self.group_id,
             "char_name": getattr(self, "char_name", ""),
-            "colors": [list(c) for c in getattr(self, "colors", [self.color])],
+            "colors": [list(c) for c in getattr(self, "colors", [self.color_bgr])],
             "char_names": getattr(self, "char_names", [getattr(self, "char_name", "")])
         }
 
 class LineShape(Shape):
-    def __init__(self, region, color, group_id=0):
-        super().__init__(region, color, group_id)
+    def __init__(self, region, color_bgr, group_id=0):
+        super().__init__(region, color_bgr, group_id)
         self.shape_type = "line"
 
     def draw(self, layer):
         if len(self.region) < 4: return
-        l_color = (*self.color, LINE_ALPHA) if len(layer.shape) > 2 and layer.shape[2] == 4 else self.color
+        l_color = (*self.color_bgr, LINE_ALPHA) if len(layer.shape) > 2 and layer.shape[2] == 4 else self.color_bgr
         pts = np.array(self.region, np.int32).reshape((-1, 2))
         cv2.polylines(layer, [pts], False, l_color, LINE_THICKNESS, cv2.LINE_AA)
 
@@ -763,21 +793,21 @@ class LineShape(Shape):
 
     def to_dict(self):
         return {
-            "type": "line", "region": self.region, "color": list(self.color), 
+            "type": "line", "region": self.region, "color": list(self.color_bgr), 
             "group_id": self.group_id,
             "char_name": getattr(self, "char_name", "")  # ★追加：キャラ名を保存
         }
 
 class TextShape(Shape):
-    def __init__(self, region, char_name, color):
-        super().__init__(region, color)
+    def __init__(self, region, char_name, color_bgr):
+        super().__init__(region, color_bgr)
         self.char_name = char_name
         self.shape_type = "text"
 
     def draw(self, draw):
         if len(self.region) < 4: return
         x1, y1 = self.region[0], self.region[1]
-        c_rgba = (self.color[2], self.color[1], self.color[0], 255)
+        c_rgba = (self.color_bgr[2], self.color_bgr[1], self.color_bgr[0], 255)
         bbox = draw.textbbox((0, 0), self.char_name, font=JP_FONT)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.rectangle([x1, y1, x1 + tw + TEXT_PAD_X*2, y1 + th + TEXT_PAD_Y*2], fill=(255,255,255,255), outline=c_rgba, width=TEXT_BG_THICKNESS)
@@ -791,7 +821,7 @@ class TextShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "text", "region": self.region, "char_name": self.char_name, "color": list(self.color)}
+        return {"type": "text", "region": self.region, "char_name": self.char_name, "color": list(self.color_bgr)}
 
 class NumberShape(Shape):
     def __init__(self, pos, num, group_id=0):
@@ -820,8 +850,8 @@ class NumberShape(Shape):
         return {"type": "number", "region": self.region, "num": self.num, "group_id": self.group_id}
 
 class ManualTextShape(Shape):
-    def __init__(self, region, text, font_size, color):
-        super().__init__(region, color)
+    def __init__(self, region, text, font_size, color_bgr):
+        super().__init__(region, color_bgr)
         self.text = text
         self.font_size = font_size
         self.shape_type = "manual_text"
@@ -829,7 +859,7 @@ class ManualTextShape(Shape):
     def draw(self, draw):
         if len(self.region) < 4: return
         tx1, ty1 = self.region[0], self.region[1]
-        clr_rgba = (self.color[2], self.color[1], self.color[0], 255)
+        clr_rgba = (self.color_bgr[2], self.color_bgr[1], self.color_bgr[0], 255)
         fnt = get_dynamic_font(self.font_size)
         draw.text((tx1, ty1), self.text, font=fnt, fill=clr_rgba)
 
@@ -840,7 +870,7 @@ class ManualTextShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "manual_text", "region": self.region, "text": self.text, "font_size": self.font_size, "color": list(self.color)}
+        return {"type": "manual_text", "region": self.region, "text": self.text, "font_size": self.font_size, "color": list(self.color_bgr)}
 
 class EraserShape(Shape):
     def __init__(self, region):
@@ -875,8 +905,8 @@ class EraserShape(Shape):
         return {"type": "eraser", "region": self.region}
 
 class GayaShape(Shape):
-    def __init__(self, pos, base_name, num, color, inverted=False):
-        super().__init__(pos, color)
+    def __init__(self, pos, base_name, num, color_bgr, inverted=False):
+        super().__init__(pos, color_bgr)
         self.base_name = base_name
         self.char_name = base_name  # CSV集計用
         self.num = num
@@ -890,7 +920,7 @@ class GayaShape(Shape):
         bbox = draw.textbbox((nx, ny), text, font=JP_FONT, anchor="mm")
         box_left, box_right = bbox[0] - TEXT_PAD_X, bbox[2] + TEXT_PAD_X
         box_top, box_bottom = bbox[1] - TEXT_PAD_Y, bbox[3] + TEXT_PAD_Y
-        c_rgba = (self.color[2], self.color[1], self.color[0], 255)
+        c_rgba = (self.color_bgr[2], self.color_bgr[1], self.color_bgr[0], 255)
         
         if self.inverted:
             bg_fill, outline_color, text_fill = (255, 255, 255, 255), c_rgba, c_rgba
@@ -905,7 +935,7 @@ class GayaShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "gaya", "region": self.region, "base_name": self.base_name, "num": self.num, "color": list(self.color), "inverted": self.inverted, "char_name": self.char_name}
+        return {"type": "gaya", "region": self.region, "base_name": self.base_name, "num": self.num, "color": list(self.color_bgr), "inverted": self.inverted, "char_name": self.char_name}
 
 
 # ─────────────────────────────────────────
@@ -1128,7 +1158,7 @@ def render_vector_layers(mul_layer, glow_layer):
     for gid in group_order:
         g_actions = group_boxes[gid]
         base_act = g_actions[0]
-        colors = getattr(base_act, 'colors', [getattr(base_act, "color", (255,255,255))])
+        colors = getattr(base_act, 'colors', [getattr(base_act, "color_bgr", (255,255,255))])
         
         shape_mask = np.zeros((h, w_orig), dtype=np.uint8)
         for act in g_actions:
@@ -1186,7 +1216,7 @@ def render_vector_layers(mul_layer, glow_layer):
         line.draw(final_mul)
         if GLOW_ALPHA > 0 and len(line.region) >= 4:
             pts = np.array(line.region, np.int32).reshape((-1, 2))
-            cv2.polylines(final_glow, [pts], False, (*getattr(line, "color", (255,255,255)), GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
+            cv2.polylines(final_glow, [pts], False, (*getattr(line, "color_bgr", (255,255,255)), GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
 
     for action in drawn_actions:
         if getattr(action, "shape_type", "") == "eraser":
@@ -1238,7 +1268,7 @@ def render():
             stype = getattr(act, "shape_type", "")
             if stype == "box" and len(act.region) >= 4:
                 x1, y1, x2, y2 = act.region
-                c = getattr(act, "color", (0, 255, 0))
+                c = getattr(act, "color_bgr", (0, 255, 0))
                 if getattr(act, "shape", "rect") == "ellipse":
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                     axes = (abs(x2 - x1) // 2, abs(y2 - y1) // 2)
@@ -1248,7 +1278,7 @@ def render():
                     cv2.rectangle(preview_display, (x1, y1), (x2, y2), c, BOX_THICKNESS)
             elif stype == "line" and len(act.region) >= 4:
                 pts = np.array(act.region, np.int32).reshape((-1, 2))
-                cv2.polylines(preview_display, [pts], False, getattr(act, "color", (0, 255, 0)), LINE_THICKNESS, cv2.LINE_AA)
+                cv2.polylines(preview_display, [pts], False, getattr(act, "color_bgr", (0, 255, 0)), LINE_THICKNESS, cv2.LINE_AA)
         
         cv2.imshow(WIN_NAME, preview_display)
         request_canvas_render() # 時間経過で2速(完全描画)に移行するまで再要求し続ける
@@ -1425,7 +1455,7 @@ def render():
             elif resizing_action:
                 r_type = resizing_action.shape_type if not isinstance(resizing_action, dict) else resizing_action.get("type")
                 r_region = resizing_action.region if not isinstance(resizing_action, dict) else resizing_action.get("region", [0,0,0,0])
-                r_color = getattr(resizing_action, "color", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color", (255,255,255))
+                r_color = getattr(resizing_action, "color_bgr", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color", (255,255,255))
                 
                 if r_type in ["number", "gaya"] and len(r_region) >= 2:
                     nx, ny = r_region[0], r_region[1]
@@ -1454,7 +1484,7 @@ def render():
                 px1, py1 = drag_start
                 px2, py2 = drag_end
                 if mode == "line":
-                    cv2.line(display_out, drag_start, drag_end, current_color, 2, cv2.LINE_AA)
+                    cv2.line(display_out, drag_start, drag_end, current_color_bgr, 2, cv2.LINE_AA)
                 elif mode == "eraser":
                     r = int(math.hypot(px2 - px1, py2 - py1))
                     if r < 5: r = ERASER_RADIUS
@@ -1467,13 +1497,13 @@ def render():
                             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                             axes = ((x2 - x1) // 2, (y2 - y1) // 2)
                             if axes[0] > 0 and axes[1] > 0:
-                                cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, current_color, 2)
+                                cv2.ellipse(display_out, (cx, cy), axes, 0, 0, 360, current_color_bgr, 2)
                         else:
-                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
+                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color_bgr, 2)
         else:
             if mode == "line" and current_polyline:
                 pts = np.array(current_polyline, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(display_out, [pts], False, current_color, 2, cv2.LINE_AA)
+                cv2.polylines(display_out, [pts], False, current_color_bgr, 2, cv2.LINE_AA)
 
             ha, part = get_hovered_handle(mouseX, mouseY)
             if ha and not alt_pressed:
@@ -1558,9 +1588,9 @@ def render():
                             cx_y, cy_y = (x1 + x2) // 2, (y1 + y2) // 2
                             axes_y = ((x2 - x1) // 2, (y2 - y1) // 2)
                             if axes_y[0] > 0 and axes_y[1] > 0:
-                                cv2.ellipse(display_out, (cx_y, cy_y), axes_y, 0, 0, 360, current_color, 2)
+                                cv2.ellipse(display_out, (cx_y, cy_y), axes_y, 0, 0, 360, current_color_bgr, 2)
                         else:
-                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color, 2)
+                            cv2.rectangle(display_out, (x1, y1), (x2, y2), current_color_bgr, 2)
 
     if show_help:
         overlay = get_help_overlay(display_out.shape[1], display_out.shape[0])
@@ -1796,7 +1826,7 @@ def open_export_dialog():
     dialog.wait_window(dialog)
 
 def handle_hud_click(mx, my, flags):
-    global current_palette_idx, current_color, current_name, yolo_enabled, char_delete_mode
+    global current_palette_idx, current_color_bgr, current_name, yolo_enabled, char_delete_mode
     global pending_gui_action, pending_gui_param
     hud_x = w_orig + 10
     
@@ -1807,6 +1837,8 @@ def handle_hud_click(mx, my, flags):
 
     if 'yolo_y_range' in globals() and yolo_y_range[0] <= my <= yolo_y_range[1]:
         yolo_enabled = not yolo_enabled
+        if yolo_enabled and model is None:
+            threading.Thread(target=download_and_load_yolo, daemon=True).start()
         request_render(); return
 
     if 'export_y_range' in globals() and export_y_range[0] <= my <= export_y_range[1]:
@@ -1832,7 +1864,7 @@ def handle_hud_click(mx, my, flags):
                     if mode == "numbering":
                         if not is_gaya:
                             current_palette_idx = i
-                            current_color = p_item["color"]
+                            current_color_bgr = p_item["color"]
                             current_name = p_item["name"]
                             request_render()
                             return
@@ -1847,7 +1879,7 @@ def handle_hud_click(mx, my, flags):
                         pending_gui_param = i
                     else:
                         current_palette_idx = i
-                        current_color = p_item["color"]
+                        current_color_bgr = p_item["color"]
                         current_name = p_item["name"]
                     request_render()
                 return
@@ -1858,7 +1890,7 @@ def handle_hud_click(mx, my, flags):
         return
 
 def run_color_chooser(idx):
-    global current_color
+    global current_color_bgr
     b, g, r = PALETTE[idx]["color"]
     init_hex = f"{r:02x}{g:02x}{b:02x}".upper()
     
@@ -1874,7 +1906,7 @@ def run_color_chooser(idx):
             # BGR形式で保存
             PALETTE[idx]["color"] = (rgb[2], rgb[1], rgb[0])
             if idx == current_palette_idx: 
-                current_color = PALETTE[idx]["color"]
+                current_color_bgr = PALETTE[idx]["color"]
             save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
             request_render()
         else:
@@ -1973,7 +2005,7 @@ def run_page_jump_dialog():
 
 
 def delete_character(idx):
-    global current_palette_idx, current_color, current_name, char_delete_mode
+    global current_palette_idx, current_color_bgr, current_name, char_delete_mode
     if len(PALETTE) <= 1:
         print("⚠ エラー: 最後のキャラクターは削除できません。")
         char_delete_mode = False
@@ -1982,7 +2014,7 @@ def delete_character(idx):
     if current_palette_idx >= idx:
         current_palette_idx = max(0, current_palette_idx - 1)
     if current_palette_idx < len(PALETTE):
-        current_color = PALETTE[current_palette_idx]["color"]
+        current_color_bgr = PALETTE[current_palette_idx]["color"]
         current_name = PALETTE[current_palette_idx]["name"]
     save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
     if len(PALETTE) <= 1:
@@ -2022,8 +2054,8 @@ def mouse_callback(event, x, y, flags, param):
                 save_undo_state()
                 if not hasattr(ha, 'colors'): ha.colors = [ha.color]
                 if not hasattr(ha, 'char_names'): ha.char_names = [getattr(ha, 'char_name', '')]
-                if current_color not in ha.colors:
-                    ha.colors.append(current_color)
+                if current_color_bgr not in ha.colors:
+                    ha.colors.append(current_color_bgr)
                     ha.char_names.append(current_name)
                 request_canvas_render()
 
@@ -2033,7 +2065,7 @@ def mouse_callback(event, x, y, flags, param):
             current_polyline[-1] = (ix, iy)
             save_undo_state()
             flat_pts = [coord for pt in current_polyline for coord in pt]
-            new_line = LineShape(flat_pts, current_color)
+            new_line = LineShape(flat_pts, current_color_bgr)
             new_line.char_name = current_name
             drawn_actions.append(new_line)
             current_polyline.clear()
@@ -2226,12 +2258,12 @@ def mouse_callback(event, x, y, flags, param):
                         target_group_id = get_target_group_id(box_region, use_shift, use_ctrl, current_name)
                         save_undo_state()
                         
-                        new_box = BoxShape(box_region, current_color, draw_shape, op, target_group_id)
+                        new_box = BoxShape(box_region, current_color_bgr, draw_shape, op, target_group_id)
                         new_box.char_name = current_name
                         drawn_actions.append(new_box)
                         
                         if op == "add":
-                            check_and_add_text_action(box_region, current_name, current_color)
+                            check_and_add_text_action(box_region, current_name, current_color_bgr)
                         request_canvas_render()
             else:
                 if (x2 - x1) >= 4 and (y2 - y1) >= 4:
@@ -2239,12 +2271,12 @@ def mouse_callback(event, x, y, flags, param):
                     target_group_id = get_target_group_id(box_region, use_shift, use_ctrl, current_name)
                     save_undo_state()
                     
-                    new_box = BoxShape(box_region, current_color, draw_shape, op, target_group_id)
+                    new_box = BoxShape(box_region, current_color_bgr, draw_shape, op, target_group_id)
                     new_box.char_name = current_name
                     drawn_actions.append(new_box)
                     
                     if op == "add":
-                        check_and_add_text_action(box_region, current_name, current_color)
+                        check_and_add_text_action(box_region, current_name, current_color_bgr)
                     request_canvas_render()
 
         elif mode == "numbering" and ix < w_orig:
@@ -2280,7 +2312,7 @@ def mouse_callback(event, x, y, flags, param):
                     
                     # c) GayaShape を追加（現在の反転状態を取得して適用）
                     p_item = PALETTE[current_palette_idx] if current_palette_idx < len(PALETTE) else {}
-                    new_gaya = GayaShape([ix, iy], current_name, next_num, current_color, p_item.get("is_inverted", False))
+                    new_gaya = GayaShape([ix, iy], current_name, next_num, current_color_bgr, p_item.get("is_inverted", False))
                     drawn_actions.append(new_gaya)
                 else:
                     # 通常のセリフ番号
@@ -2291,13 +2323,13 @@ def mouse_callback(event, x, y, flags, param):
         elif mode == "line" and ix < w_orig:
             if not is_click:
                 save_undo_state()
-                new_line = LineShape([px1, py1, px2, py2], current_color)
+                new_line = LineShape([px1, py1, px2, py2], current_color_bgr)
                 new_line.char_name = current_name
                 drawn_actions.append(new_line)
                 
                 lx1, ly1 = min(px1, px2), min(py1, py2)
                 lx2, ly2 = max(px1, px2), max(py1, py2)
-                check_and_add_text_action([lx1, ly1, lx2, ly2], current_name, current_color)
+                check_and_add_text_action([lx1, ly1, lx2, ly2], current_name, current_color_bgr)
                 request_canvas_render()
 
         render()
@@ -2327,7 +2359,8 @@ def _async_save_bg(p_idx, actions, n_cnt, p_pos=None):
     try:
         with open(os.path.join(out_dir, "state.json"), "w", encoding="utf-8") as f:
             json.dump({"number_counter": n_cnt, "drawn_actions": _make_serializable(actions), "page_pos": p_pos}, f, ensure_ascii=False, indent=2)
-    except: pass
+    except Exception as e:
+        print(f"⚠️ [Data Save Error] Page {p_idx+1}: {e}")
 
 def save_current_page():
     # [AI Constraint] current_page_pos はページ番号のカスタム座標。メモリ保存に必須。
@@ -2853,7 +2886,7 @@ while True:
                     if loaded_pal:
                         PALETTE = loaded_pal
                         current_palette_idx = 0
-                        current_color = PALETTE[0]["color"]
+                        current_color_bgr = PALETTE[0]["color"]
                         current_name = PALETTE[0]["name"]
                         save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
                         print(f"🔄 パレットを {os.path.basename(new_csv_path)} の内容で上書き更新しました")
@@ -2916,6 +2949,8 @@ while True:
         dragging = False
         resizing_action = None
         yolo_enabled = not yolo_enabled
+        if yolo_enabled and model is None:
+            threading.Thread(target=download_and_load_yolo, daemon=True).start()
         request_render()
         if yolo_enabled and not bboxes:
             load_page(page_idx)
@@ -2959,15 +2994,12 @@ while True:
 cv2.destroyAllWindows()
 cv2.waitKey(1)
 
-# 終了時エクスポートフラグの処理（旧式の残骸クリーンアップ）
-if export_enabled:
-    # 実際には一括出力ダイアログ(KEY_TOGGLE_EXPORT)から実行するため、ここは念のための安全弁
-    export_character_pages_csv()
-    export_to_pdf()
+# [AI Constraint] 旧式の自動エクスポート処理（デッドコード）を完全削除
 
 try:
     doc.close()
-except: pass
+except Exception as e:
+    print(f"⚠️ Error closing document: {e}")
 
 import os
 os._exit(0)
