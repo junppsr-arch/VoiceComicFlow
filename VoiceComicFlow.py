@@ -160,7 +160,7 @@ DISPLAY_MAX_H     = 980
 
 # --- 動作パフォーマンス設定 (3段変速ロード) ---
 PREFETCH_PAGES    = 20      # 先読み・保持するページ数 (前後)
-GEAR2_DELAY       = 0.6     # 2速: 丸付けの詳細(文字・透明度・UI)を表示するまでの待機秒数
+GEAR2_DELAY       = 0.4     # 2速: 丸付けの詳細(文字・透明度・UI)を表示するまでの待機秒数
 GEAR3_YOLO_DELAY  = 3.0     # 3速: AI(YOLO)が裏で起動するまでの待機秒数
 
 NUMBER_FONT       = cv2.FONT_HERSHEY_SIMPLEX
@@ -1103,9 +1103,9 @@ def recalculate_gaya_numbers():
 # ─────────────────────────────────────────
 # 7. コア描画 (render)
 # ─────────────────────────────────────────
-def render_boxes_to_layer(target_layer):
+def render_vector_layers(mul_layer, glow_layer):
     line_mask = np.zeros((h, w_orig), dtype=np.uint8)
-    lines = [sh for sh in drawn_actions if isinstance(sh, LineShape)]
+    lines = [sh for sh in drawn_actions if getattr(sh, "shape_type", "") == "line"]
     for line in lines:
         if len(line.region) < 4: continue
         pts = np.array(line.region, np.int32).reshape((-1, 2))
@@ -1114,102 +1114,31 @@ def render_boxes_to_layer(target_layer):
     group_order = []
     group_boxes = {}
     for action in drawn_actions:
-        if isinstance(action, BoxShape):
-            gid = action.group_id
+        if getattr(action, "shape_type", "") == "box":
+            gid = getattr(action, "group_id", 0)
             if gid not in group_boxes:
                 group_boxes[gid] = []
                 group_order.append(gid)
             group_boxes[gid].append(action)
 
-    final_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-    kernel = np.ones((ERASE_GAP*2+1, ERASE_GAP*2+1), np.uint8)
-
-    for gid in group_order:
-        g_actions = group_boxes[gid]
-        base_act = g_actions[0]
-        colors = getattr(base_act, 'colors', [base_act.color])
-        alpha_val = BOX_ALPHA
-        
-        shape_mask = np.zeros((h, w_orig), dtype=np.uint8)
-        for act in g_actions:
-            fill_val = 255 if act.op == "add" else 0
-            act.draw(shape_mask, thickness=-1, color_override=fill_val)
-        contours, _ = cv2.findContours(shape_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        g_layer_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
-        if len(contours) > 0:
-            x, y, w_box, h_box = cv2.boundingRect(np.vstack(contours))
-            cx, cy = x + w_box / 2.0, y + h_box / 2.0
-            radius = max(w_box, h_box) * 1.5
-            N = len(colors)
-            
-            for i, c in enumerate(colors):
-                c_bgra = (*c, alpha_val)
-                temp_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-                cv2.drawContours(temp_layer, contours, -1, c_bgra, BOX_THICKNESS, cv2.LINE_AA)
-                
-                if N > 1:
-                    start_angle = (i * 360.0 / N) - 90
-                    end_angle = ((i + 1) * 360.0 / N) - 90
-                    wedge_mask = np.zeros((h, w_orig), dtype=np.uint8)
-                    cv2.ellipse(wedge_mask, (int(cx), int(cy)), (int(radius), int(radius)), 0, start_angle, end_angle, 255, -1)
-                    mask = (temp_layer[:, :, 3] > 0) & (wedge_mask > 0)
-                    g_layer_combined[mask] = temp_layer[mask]
-                else:
-                    mask = temp_layer[:, :, 3] > 0
-                    g_layer_combined[mask] = temp_layer[mask]
-
-        g_layer_combined[line_mask > 0] = 0
-
-        erase_mask = cv2.dilate(shape_mask, kernel, iterations=1)
-        final_layer[erase_mask > 0] = 0
-        final_layer = cv2.add(final_layer, g_layer_combined)
-
-    for line in lines:
-        line.draw(final_layer)
-
-    for action in drawn_actions:
-        if isinstance(action, EraserShape):
-            action.draw(final_layer)
-
-    np.copyto(target_layer, final_layer)
-
-def render_glow_to_layer(std_layer):
-    if GLOW_ALPHA <= 0: return
-    
-    line_mask = np.zeros((h, w_orig), dtype=np.uint8)
-    lines = [sh for sh in drawn_actions if isinstance(sh, LineShape)]
-    for line in lines:
-        if len(line.region) < 4: continue
-        pts = np.array(line.region, np.int32).reshape((-1, 2))
-        cv2.polylines(line_mask, [pts], False, 255, LINE_THICKNESS + LINE_ERASE_GAP * 2, cv2.LINE_AA)
-
-    group_order = []
-    group_boxes = {}
-    for action in drawn_actions:
-        if isinstance(action, BoxShape):
-            gid = action.group_id
-            if gid not in group_boxes:
-                group_boxes[gid] = []
-                group_order.append(gid)
-            group_boxes[gid].append(action)
-
+    final_mul = np.zeros((h, w_orig, 4), dtype=np.uint8)
     final_glow = np.zeros((h, w_orig, 4), dtype=np.uint8)
     kernel = np.ones((ERASE_GAP*2+1, ERASE_GAP*2+1), np.uint8)
 
     for gid in group_order:
         g_actions = group_boxes[gid]
         base_act = g_actions[0]
-        colors = getattr(base_act, 'colors', [base_act.color])
-        alpha_val = GLOW_ALPHA
+        colors = getattr(base_act, 'colors', [getattr(base_act, "color", (255,255,255))])
         
         shape_mask = np.zeros((h, w_orig), dtype=np.uint8)
         for act in g_actions:
-            fill_val = 255 if act.op == "add" else 0
+            fill_val = 255 if getattr(act, "op", "add") == "add" else 0
             act.draw(shape_mask, thickness=-1, color_override=fill_val)
         contours, _ = cv2.findContours(shape_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-        g_layer_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        g_mul_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        g_glow_combined = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        
         if len(contours) > 0:
             x, y, w_box, h_box = cv2.boundingRect(np.vstack(contours))
             cx, cy = x + w_box / 2.0, y + h_box / 2.0
@@ -1217,37 +1146,57 @@ def render_glow_to_layer(std_layer):
             N = len(colors)
             
             for i, c in enumerate(colors):
-                c_bgra = (*c, alpha_val)
-                temp_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-                cv2.drawContours(temp_layer, contours, -1, c_bgra, BOX_THICKNESS, cv2.LINE_AA)
+                temp_mul = np.zeros((h, w_orig, 4), dtype=np.uint8)
+                temp_glow = np.zeros((h, w_orig, 4), dtype=np.uint8)
+                
+                cv2.drawContours(temp_mul, contours, -1, (*c, BOX_ALPHA), BOX_THICKNESS, cv2.LINE_AA)
+                if GLOW_ALPHA > 0:
+                    cv2.drawContours(temp_glow, contours, -1, (*c, GLOW_ALPHA), BOX_THICKNESS, cv2.LINE_AA)
                 
                 if N > 1:
                     start_angle = (i * 360.0 / N) - 90
                     end_angle = ((i + 1) * 360.0 / N) - 90
                     wedge_mask = np.zeros((h, w_orig), dtype=np.uint8)
                     cv2.ellipse(wedge_mask, (int(cx), int(cy)), (int(radius), int(radius)), 0, start_angle, end_angle, 255, -1)
-                    mask = (temp_layer[:, :, 3] > 0) & (wedge_mask > 0)
-                    g_layer_combined[mask] = temp_layer[mask]
+                    
+                    mask_mul = (temp_mul[:, :, 3] > 0) & (wedge_mask > 0)
+                    g_mul_combined[mask_mul] = temp_mul[mask_mul]
+                    if GLOW_ALPHA > 0:
+                        mask_glow = (temp_glow[:, :, 3] > 0) & (wedge_mask > 0)
+                        g_glow_combined[mask_glow] = temp_glow[mask_glow]
                 else:
-                    mask = temp_layer[:, :, 3] > 0
-                    g_layer_combined[mask] = temp_layer[mask]
+                    mask_mul = temp_mul[:, :, 3] > 0
+                    g_mul_combined[mask_mul] = temp_mul[mask_mul]
+                    if GLOW_ALPHA > 0:
+                        mask_glow = temp_glow[:, :, 3] > 0
+                        g_glow_combined[mask_glow] = temp_glow[mask_glow]
 
-        g_layer_combined[line_mask > 0] = 0
+        g_mul_combined[line_mask > 0] = 0
+        g_glow_combined[line_mask > 0] = 0
 
         erase_mask = cv2.dilate(shape_mask, kernel, iterations=1)
-        final_glow[erase_mask > 0] = 0
-        final_glow = cv2.add(final_glow, g_layer_combined)
+        final_mul[erase_mask > 0] = 0
+        final_mul = cv2.add(final_mul, g_mul_combined)
+        
+        if GLOW_ALPHA > 0:
+            final_glow[erase_mask > 0] = 0
+            final_glow = cv2.add(final_glow, g_glow_combined)
 
     for line in lines:
-        if len(line.region) < 4: continue
-        pts = np.array(line.region, np.int32).reshape((-1, 2))
-        cv2.polylines(final_glow, [pts], False, (*line.color, GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
+        line.draw(final_mul)
+        if GLOW_ALPHA > 0 and len(line.region) >= 4:
+            pts = np.array(line.region, np.int32).reshape((-1, 2))
+            cv2.polylines(final_glow, [pts], False, (*getattr(line, "color", (255,255,255)), GLOW_ALPHA), LINE_THICKNESS, cv2.LINE_AA)
 
     for action in drawn_actions:
-        if isinstance(action, EraserShape):
-            action.draw(final_glow)
+        if getattr(action, "shape_type", "") == "eraser":
+            action.draw(final_mul)
+            if GLOW_ALPHA > 0:
+                action.draw(final_glow)
 
-    std_layer[:] = cv2.add(std_layer, final_glow)
+    np.copyto(mul_layer, final_mul)
+    np.copyto(glow_layer, final_glow)
+
 
 # ─────────────────────────────────────────
 # 通信・フラグ用 (スレッド安全なGUI用)
@@ -1309,18 +1258,23 @@ def render():
         base_img = img.copy().astype(np.float32)
 
         mul_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-        render_boxes_to_layer(mul_layer)
+        glow_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        render_vector_layers(mul_layer, glow_layer)
+
         m_alpha = mul_layer[:, :, 3:4].astype(np.float32) / 255.0
-        m_rgb = mul_layer[:, :, :3].astype(np.float32)
-        multiplied = (base_img * m_rgb / 255.0)
+        m_bgr = mul_layer[:, :, :3].astype(np.float32)
+        multiplied = (base_img * m_bgr / 255.0)
         base_img = multiplied * m_alpha + base_img * (1.0 - m_alpha)
 
-        std_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
-        render_glow_to_layer(std_layer)
-        render_texts_to_layer(std_layer)
-        s_alpha = std_layer[:, :, 3:4].astype(np.float32) / 255.0
-        s_rgb = std_layer[:, :, :3].astype(np.float32)
-        final_img = (s_rgb * s_alpha + base_img * (1.0 - s_alpha)).astype(np.uint8)
+        g_alpha = glow_layer[:, :, 3:4].astype(np.float32) / 255.0
+        g_bgr = glow_layer[:, :, :3].astype(np.float32)
+        base_img = g_bgr * g_alpha + base_img * (1.0 - g_alpha)
+
+        text_layer = np.zeros((h, w_orig, 4), dtype=np.uint8)
+        render_texts_to_layer(text_layer)
+        t_alpha = text_layer[:, :, 3:4].astype(np.float32) / 255.0
+        t_bgr = text_layer[:, :, :3].astype(np.float32)
+        final_img = (t_bgr * t_alpha + base_img * (1.0 - t_alpha)).astype(np.uint8)
 
         cached_display[:, :w_orig] = final_img
         need_canvas_render = False
@@ -1661,6 +1615,9 @@ def get_used_characters():
     return used
 
 def open_export_dialog():
+    # [AI Constraint] 出力前に現在編集中のページを確実にメモリとディスクに保存・確定させる
+    save_current_page()
+    
     dialog = tk.Toplevel(_root)
     dialog.title("一括出力設定")
     dialog.geometry("550x750") # ボタンが隠れないよう高さを調整
@@ -2508,18 +2465,23 @@ def export_to_pdf(target_pages=None):
         current_page_pos = _saved_page_pos if i == _saved_page_idx else mem.get("page_pos", None)
 
         mul_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
-        render_boxes_to_layer(mul_layer)
+        glow_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+        render_vector_layers(mul_layer, glow_layer)
+
         m_alpha = mul_layer[:, :, 3:4].astype(np.float32) / 255.0
-        m_rgb   = mul_layer[:, :, :3].astype(np.float32)
-        multiplied = (base_float * m_rgb / 255.0)
+        m_bgr   = mul_layer[:, :, :3].astype(np.float32)
+        multiplied = (base_float * m_bgr / 255.0)
         final_float = multiplied * m_alpha + base_float * (1.0 - m_alpha)
 
-        std_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
-        render_glow_to_layer(std_layer)
-        render_texts_to_layer(std_layer)
-        s_alpha = std_layer[:, :, 3:4].astype(np.float32) / 255.0
-        s_rgb   = std_layer[:, :, :3].astype(np.float32)
-        final_float = s_rgb * s_alpha + final_float * (1.0 - s_alpha)
+        g_alpha = glow_layer[:, :, 3:4].astype(np.float32) / 255.0
+        g_bgr   = glow_layer[:, :, :3].astype(np.float32)
+        final_float = g_bgr * g_alpha + final_float * (1.0 - g_alpha)
+
+        text_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+        render_texts_to_layer(text_layer)
+        t_alpha = text_layer[:, :, 3:4].astype(np.float32) / 255.0
+        t_bgr   = text_layer[:, :, :3].astype(np.float32)
+        final_float = t_bgr * t_alpha + final_float * (1.0 - t_alpha)
         
         final_img_uint8 = final_float.astype(np.uint8)
         final_rgb = cv2.cvtColor(final_img_uint8, cv2.COLOR_BGR2RGB)
@@ -2542,12 +2504,19 @@ def export_to_pdf(target_pages=None):
     page_idx = _saved_page_idx
     current_page_pos = _saved_page_pos
 
-    try:
-        out_pdf.save(output_pdf_path)
-        out_pdf.close()
-        print(f"✅ PDF出力完了: {output_pdf_path}")
-    except Exception as e:
-        print(f"PDF保存エラー: {e}")
+    saved = False
+    while not saved:
+        try:
+            out_pdf.save(output_pdf_path)
+            out_pdf.close()
+            print(f"✅ PDF出力完了: {output_pdf_path}")
+            saved = True
+        except Exception as e:
+            retry = messagebox.askretrycancel("保存エラー", f"PDFの保存に失敗しました。\n出力先のファイルがAcrobat等で開かれている可能性があります。\n閉じてから「再試行」を押してください。\n\n詳細: {e}")
+            if not retry:
+                print("PDF出力をキャンセルしました。")
+                out_pdf.close()
+                break
 
 def export_to_script_pdf(selected_char_names, target_pages=None):
     print("🔄 キャラ別抜き台本を出力中...")
@@ -2606,21 +2575,24 @@ def export_to_script_pdf(selected_char_names, target_pages=None):
                 drawn_actions = copy.deepcopy(acts)
                 current_page_pos = _saved_page_pos if p_idx == _saved_page_idx else mem.get("page_pos", None)
 
-                # 1. 乗算レイヤー（枠）
                 mul_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
-                render_boxes_to_layer(mul_layer)
+                glow_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+                render_vector_layers(mul_layer, glow_layer)
+
                 m_alpha = mul_layer[:, :, 3:4].astype(np.float32) / 255.0
-                m_rgb   = mul_layer[:, :, :3].astype(np.float32)
-                multiplied = (base_float * m_rgb / 255.0)
+                m_bgr   = mul_layer[:, :, :3].astype(np.float32)
+                multiplied = (base_float * m_bgr / 255.0)
                 final_float = multiplied * m_alpha + base_float * (1.0 - m_alpha)
 
-                # 2. 通常レイヤー（発光・テキスト・番号）
-                std_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
-                render_glow_to_layer(std_layer)
-                render_texts_to_layer(std_layer)
-                s_alpha = std_layer[:, :, 3:4].astype(np.float32) / 255.0
-                s_rgb   = std_layer[:, :, :3].astype(np.float32)
-                final_float = s_rgb * s_alpha + final_float * (1.0 - s_alpha)
+                g_alpha = glow_layer[:, :, 3:4].astype(np.float32) / 255.0
+                g_bgr   = glow_layer[:, :, :3].astype(np.float32)
+                final_float = g_bgr * g_alpha + final_float * (1.0 - g_alpha)
+
+                text_layer = np.zeros((ph, pw, 4), dtype=np.uint8)
+                render_texts_to_layer(text_layer)
+                t_alpha = text_layer[:, :, 3:4].astype(np.float32) / 255.0
+                t_bgr   = text_layer[:, :, :3].astype(np.float32)
+                final_float = t_bgr * t_alpha + final_float * (1.0 - t_alpha)
                 
                 # PDF挿入用に変換
                 final_img_uint8 = final_float.astype(np.uint8)
@@ -2636,11 +2608,20 @@ def export_to_script_pdf(selected_char_names, target_pages=None):
                 new_page.insert_image(rect, stream=img_bytes)
 
         if len(out_pdf) > 0:
-            # 命名規則: 作品名__キャラ名.pdf
             output_name = f"{clean_base_name}__{char_name}.pdf"
             output_path = os.path.join(script_dir, output_name)
-            out_pdf.save(output_path)
-            print(f"    ✅ 保存: {os.path.basename(output_path)}")
+            
+            saved = False
+            while not saved:
+                try:
+                    out_pdf.save(output_path)
+                    print(f"    ✅ 保存: {os.path.basename(output_path)}")
+                    saved = True
+                except Exception as e:
+                    retry = messagebox.askretrycancel("保存エラー", f"「{char_name}」の台本保存に失敗しました。\nファイルが開かれている可能性があります。\n閉じてから「再試行」を押してください。\n\n詳細: {e}")
+                    if not retry:
+                        print(f"    ❌ 保存キャンセル: {char_name}")
+                        break
         out_pdf.close()
         
     # グローバル状態を復元（編集中だったページに戻す）
@@ -2691,33 +2672,32 @@ def export_to_psd_layers(target_pages=None):
         current_page_pos = _saved_page_pos if i == _saved_page_idx else mem.get("page_pos", None)
 
         # 3. レイヤー画像の生成
-        # a) 背景レイヤー (通常) - Pillow Image
         base_pil = Image.fromarray(base_np).convert("RGB")
 
-        # b) 丸付けレイヤー (乗算)
         mul_layer_np = np.zeros((ph, pw, 4), dtype=np.uint8)
-        render_boxes_to_layer(mul_layer_np)
+        glow_layer_np = np.zeros((ph, pw, 4), dtype=np.uint8)
+        render_vector_layers(mul_layer_np, glow_layer_np)
+        
         mul_pil = Image.fromarray(cv2.cvtColor(mul_layer_np, cv2.COLOR_BGRA2RGBA))
+        glow_pil = Image.fromarray(cv2.cvtColor(glow_layer_np, cv2.COLOR_BGRA2RGBA))
 
-        # c) テキスト・発光レイヤー (通常)
-        std_layer_np = np.zeros((ph, pw, 4), dtype=np.uint8)
-        render_glow_to_layer(std_layer_np)
-        render_texts_to_layer(std_layer_np)
-        std_pil = Image.fromarray(cv2.cvtColor(std_layer_np, cv2.COLOR_BGRA2RGBA))
+        text_layer_np = np.zeros((ph, pw, 4), dtype=np.uint8)
+        render_texts_to_layer(text_layer_np)
+        text_pil = Image.fromarray(cv2.cvtColor(text_layer_np, cv2.COLOR_BGRA2RGBA))
 
         # 4. PSDの組み立て
         psd = PSDImage.new(mode='RGB', size=(pw, ph), depth=8)
         
-        # ★修正: レイヤー名を英語に変更（エンコードエラー回避）
-        # 背景
         psd.create_pixel_layer(base_pil, name="Background", top=0, left=0)
         
-        # 丸付け (乗算)
         l_mul = psd.create_pixel_layer(mul_pil, name="Multiply_Frames", top=0, left=0)
         l_mul.blend_mode = BlendMode.MULTIPLY
         
-        # テキスト・発光 (通常)
-        psd.create_pixel_layer(std_pil, name="Normal_Text", top=0, left=0)
+        # 発光レイヤー (通常/加算)
+        psd.create_pixel_layer(glow_pil, name="Glow_Frames", top=0, left=0)
+        
+        # テキスト・番号レイヤー (通常)
+        psd.create_pixel_layer(text_pil, name="Text_and_Numbers", top=0, left=0)
 
         # 5. 保存
         logical_num = i - LOGICAL_PAGE_OFFSET + 1
