@@ -138,11 +138,11 @@ TEXT_BOLDNESS_STROKE   = 1       # ★キャラ名の文字の太さ(0-5程度)
 NUMBER_BOLDNESS_STROKE = 1       # ★セリフ番号の文字の太さ(0-5程度)
 PAGE_BOLDNESS_STROKE   = 1       # ★ページ番号の文字の太さ(0-5程度)
 
-PAGE_TEXT_SIZE    = 35      # ページ番号
-PAGE_OUTER_STROKE = 3
+PAGE_TEXT_SIZE    = 30      # ページ番号
+PAGE_OUTER_STROKE = 4
 PAGE_INNER_STROKE = 0
-PAGE_POS_MARGIN_X = 20      # 右端からのオフセット
-PAGE_POS_MARGIN_Y = 20      # 上端からのオフセット
+PAGE_POS_MARGIN_X = 10      # 右端からのオフセット
+PAGE_POS_MARGIN_Y = 10      # 上端からのオフセット
 
 MANUAL_TEXT_SIZE  = 40      # 自由テキスト
 MANUAL_TEXT_COLOR = (255, 255, 255) # BGR(白)
@@ -189,8 +189,6 @@ KEY_TOGGLE_EXPORT = ord('t')  # 終了時の自動出力(PDF/CSV/JSX)のON/OFF
 KEY_LOAD_PALETTE  = ord('g')  # パレット(CSV)の手動読み込み
 KEY_TOGGLE_YOLO   = ord('y')  # YOLO検知のON/OFF切り替え
 KEY_TOGGLE_HELP   = ord('h')  # ヘルプ表示のON/OFF
-
-export_enabled = False        # 終了時にCSV/PDFを出力するかどうかのフラグ
 
 def get_help_lines():
     """現在のキーバインド設定を読み取り、整形された操作ガイドのテキストリストを返す"""
@@ -330,7 +328,7 @@ def load_palette_from_csv(path):
                     if len(h_str) == 6:
                         rgb = tuple(int(h_str[i:i+2], 16) for i in (0, 2, 4))
                         bgr = (rgb[2], rgb[1], rgb[0])
-                new_palette.append({"name": name, "color": bgr, "is_inverted": is_inverted})
+                new_palette.append({"name": name, "color_bgr": bgr, "is_inverted": is_inverted})
     return new_palette
 
 def save_project_palette(palette, path):
@@ -341,7 +339,7 @@ def save_project_palette(palette, path):
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
             writer.writerow(["キャラ名", "カラーコード", "反転フラグ"])
             for p in palette:
-                b, g, r = p["color"]
+                b, g, r = p["color_bgr"]
                 hex_color = f"#{r:02x}{g:02x}{b:02x}"
                 writer.writerow([p["name"], hex_color, p.get("is_inverted", False)])
     except Exception as e:
@@ -425,9 +423,9 @@ else:
     if not PALETTE:
         print("[INFO] characters.csvが見つからないため、デフォルトパレットを使用します。")
         PALETTE = [
-            {"name": "キャラA", "color": (255, 0, 0), "is_inverted": False},
-            {"name": "キャラB", "color": (0, 0, 255), "is_inverted": False},
-            {"name": "キャラC", "color": (0, 200, 0), "is_inverted": False},
+            {"name": "キャラA", "color_bgr": (255, 0, 0), "is_inverted": False},
+            {"name": "キャラB", "color_bgr": (0, 0, 255), "is_inverted": False},
+            {"name": "キャラC", "color_bgr": (0, 200, 0), "is_inverted": False},
         ]
     save_project_palette(PALETTE, proj_csv_path)
     print(f"🎨 大元パレットをコピーし、専用パレットを作成しました")
@@ -567,11 +565,11 @@ mode           = "color"
 # ▼ 追加：読み込んだ結果パレットが空になっていた場合の自己修復
 if not PALETTE:
     print("⚠️ パレットが空のため、初期キャラクターを生成します。")
-    PALETTE = [{"name": "新規キャラ", "color": (255, 255, 255), "is_inverted": False}]
+    PALETTE = [{"name": "新規キャラ", "color_bgr": (255, 255, 255), "is_inverted": False}]
     save_project_palette(PALETTE, proj_csv_path)
 
 current_palette_idx = 0
-current_color_bgr = PALETTE[0]["color"]
+current_color_bgr = PALETTE[0]["color_bgr"]
 current_name  = PALETTE[0]["name"]
 
 dragging       = False
@@ -687,7 +685,7 @@ class Shape:
     def from_dict(cls, data):
         stype = data.get("type")
         region = data.get("region", [])
-        color_bgr = data.get("color")
+        color_bgr = data.get("color_bgr")
         group_id = data.get("group_id", 0)
 
         obj = None
@@ -757,7 +755,7 @@ class BoxShape(Shape):
 
     def to_dict(self):
         return {
-            "type": "box", "region": self.region, "color": list(self.color_bgr),
+            "type": "box", "region": self.region, "color_bgr": list(self.color_bgr),
             "shape": self.shape, "op": self.op, "group_id": self.group_id,
             "char_name": getattr(self, "char_name", ""),
             "colors": [list(c) for c in getattr(self, "colors", [self.color_bgr])],
@@ -793,7 +791,7 @@ class LineShape(Shape):
 
     def to_dict(self):
         return {
-            "type": "line", "region": self.region, "color": list(self.color_bgr), 
+            "type": "line", "region": self.region, "color_bgr": list(self.color_bgr), 
             "group_id": self.group_id,
             "char_name": getattr(self, "char_name", "")  # ★追加：キャラ名を保存
         }
@@ -821,7 +819,7 @@ class TextShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "text", "region": self.region, "char_name": self.char_name, "color": list(self.color_bgr)}
+        return {"type": "text", "region": self.region, "char_name": self.char_name, "color_bgr": list(self.color_bgr)}
 
 class NumberShape(Shape):
     def __init__(self, pos, num, group_id=0):
@@ -870,7 +868,7 @@ class ManualTextShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "manual_text", "region": self.region, "text": self.text, "font_size": self.font_size, "color": list(self.color_bgr)}
+        return {"type": "manual_text", "region": self.region, "text": self.text, "font_size": self.font_size, "color_bgr": list(self.color_bgr)}
 
 class EraserShape(Shape):
     def __init__(self, region):
@@ -935,7 +933,7 @@ class GayaShape(Shape):
         return None, None
 
     def to_dict(self):
-        return {"type": "gaya", "region": self.region, "base_name": self.base_name, "num": self.num, "color": list(self.color_bgr), "inverted": self.inverted, "char_name": self.char_name}
+        return {"type": "gaya", "region": self.region, "base_name": self.base_name, "num": self.num, "color_bgr": list(self.color_bgr), "inverted": self.inverted, "char_name": self.char_name}
 
 
 # ─────────────────────────────────────────
@@ -1381,12 +1379,12 @@ def render():
                 if mode == "numbering" and is_gaya:
                     bg_color = (0, 120, 240)
                 else:
-                    bg_color = (p_item["color"][0]//2, p_item["color"][1]//2, p_item["color"][2]//2)
+                    bg_color = (p_item["color_bgr"][0]//2, p_item["color_bgr"][1]//2, p_item["color_bgr"][2]//2)
 
             cv2.rectangle(display, (w_orig+5, temp_y-25), (w_orig+HUD_WIDTH-5, temp_y+5), bg_color, -1)
             
             display_inverted = p_item.get("is_inverted", False) if is_gaya else False
-            swatch_color = p_item["color"]
+            swatch_color = p_item["color_bgr"]
             
             if display_inverted:
                 cv2.rectangle(display, (hud_x, temp_y-20), (hud_x+30, temp_y), (255, 255, 255), -1)
@@ -1413,7 +1411,7 @@ def render():
                 p_item = PALETTE[i]
                 is_gaya = "ガヤ" in p_item["name"]
                 display_inverted = p_item.get("is_inverted", False) if is_gaya else False
-                swatch_color = p_item["color"]
+                swatch_color = p_item["color_bgr"]
                 
                 text_fill = (255, 255, 255, 255)
                 if char_delete_mode: text_fill = (150, 150, 150, 255)
@@ -1455,7 +1453,7 @@ def render():
             elif resizing_action:
                 r_type = resizing_action.shape_type if not isinstance(resizing_action, dict) else resizing_action.get("type")
                 r_region = resizing_action.region if not isinstance(resizing_action, dict) else resizing_action.get("region", [0,0,0,0])
-                r_color = getattr(resizing_action, "color_bgr", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color", (255,255,255))
+                r_color = getattr(resizing_action, "color_bgr", (255, 255, 255)) if not isinstance(resizing_action, dict) else resizing_action.get("color_bgr", (255,255,255))
                 
                 if r_type in ["number", "gaya"] and len(r_region) >= 2:
                     nx, ny = r_region[0], r_region[1]
@@ -1864,7 +1862,7 @@ def handle_hud_click(mx, my, flags):
                     if mode == "numbering":
                         if not is_gaya:
                             current_palette_idx = i
-                            current_color_bgr = p_item["color"]
+                            current_color_bgr = p_item["color_bgr"]
                             current_name = p_item["name"]
                             request_render()
                             return
@@ -1879,7 +1877,7 @@ def handle_hud_click(mx, my, flags):
                         pending_gui_param = i
                     else:
                         current_palette_idx = i
-                        current_color_bgr = p_item["color"]
+                        current_color_bgr = p_item["color_bgr"]
                         current_name = p_item["name"]
                     request_render()
                 return
@@ -1891,7 +1889,7 @@ def handle_hud_click(mx, my, flags):
 
 def run_color_chooser(idx):
     global current_color_bgr
-    b, g, r = PALETTE[idx]["color"]
+    b, g, r = PALETTE[idx]["color_bgr"]
     init_hex = f"{r:02x}{g:02x}{b:02x}".upper()
     
     root = tk.Tk()
@@ -1904,9 +1902,9 @@ def run_color_chooser(idx):
         if len(new_hex) == 6 and all(c in "0123456789ABCDEFabcdef" for c in new_hex):
             rgb = tuple(int(new_hex[i:i+2], 16) for i in (0, 2, 4))
             # BGR形式で保存
-            PALETTE[idx]["color"] = (rgb[2], rgb[1], rgb[0])
+            PALETTE[idx]["color_bgr"] = (rgb[2], rgb[1], rgb[0])
             if idx == current_palette_idx: 
-                current_color_bgr = PALETTE[idx]["color"]
+                current_color_bgr = PALETTE[idx]["color_bgr"]
             save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
             request_render()
         else:
@@ -1930,7 +1928,7 @@ def run_add_char_dialog():
                 if len(h_val) == 6:
                     rgb = tuple(int(h_val[j:j+2], 16) for j in (0, 2, 4))
                     bgr = (rgb[2], rgb[1], rgb[0])
-            PALETTE.append({"name": name, "color": bgr, "is_inverted": False})
+            PALETTE.append({"name": name, "color_bgr": bgr, "is_inverted": False})
             added = True
         if added:
             save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
@@ -2014,7 +2012,7 @@ def delete_character(idx):
     if current_palette_idx >= idx:
         current_palette_idx = max(0, current_palette_idx - 1)
     if current_palette_idx < len(PALETTE):
-        current_color_bgr = PALETTE[current_palette_idx]["color"]
+        current_color_bgr = PALETTE[current_palette_idx]["color_bgr"]
         current_name = PALETTE[current_palette_idx]["name"]
     save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
     if len(PALETTE) <= 1:
@@ -2052,7 +2050,8 @@ def mouse_callback(event, x, y, flags, param):
             ha, _ = get_hovered_handle(ix, iy, flags)
             if isinstance(ha, BoxShape):
                 save_undo_state()
-                if not hasattr(ha, 'colors'): ha.colors = [ha.color]
+                # [AI Constraint] ha.color ではなく ha.color_bgr を使用
+                if not hasattr(ha, 'colors'): ha.colors = [ha.color_bgr]
                 if not hasattr(ha, 'char_names'): ha.char_names = [getattr(ha, 'char_name', '')]
                 if current_color_bgr not in ha.colors:
                     ha.colors.append(current_color_bgr)
@@ -2082,6 +2081,36 @@ def mouse_callback(event, x, y, flags, param):
                     resizing_action = "page_pos"
                     drag_start_region = current_page_pos if current_page_pos else (px1, py1)
                     return
+            
+            # [AI Constraint] 番号付与を LBUTTONUP から LBUTTONDOWN に移動して体感ラグとブレによる取りこぼしをゼロにする
+            ha, part = get_hovered_handle(ix, iy, flags)
+            if not ha:
+                save_undo_state()
+                if "ガヤ" in current_name:
+                    for act in list(drawn_actions):
+                        if isinstance(act, TextShape) and getattr(act, "char_name", "") == current_name:
+                            drawn_actions.remove(act)
+                    for p in range(TOTAL_PAGES):
+                        if p == page_idx: continue
+                        mem = GLOBAL_MEMORY.get(p, {})
+                        acts = mem.get("drawn_actions", [])
+                        original_len = len(acts)
+                        filtered_acts = [a for a in acts if not (getattr(a, "shape_type", "") == "text" and getattr(a, "char_name", "") == current_name)]
+                        if len(filtered_acts) != original_len:
+                            GLOBAL_MEMORY[p]["drawn_actions"] = filtered_acts
+                            GLOBAL_MEMORY[p]["is_dirty"] = True
+                            _async_save_bg(p, filtered_acts, mem.get("number_counter", 1))
+                    
+                    next_num = get_next_gaya_number(current_name)
+                    p_item = PALETTE[current_palette_idx] if current_palette_idx < len(PALETTE) else {}
+                    new_gaya = GayaShape([ix, iy], current_name, next_num, current_color_bgr, p_item.get("is_inverted", False))
+                    drawn_actions.append(new_gaya)
+                else:
+                    drawn_actions.append(NumberShape([ix, iy], number_counter))
+                    number_counter += 1
+                request_canvas_render()
+                render()
+                return # ドラッグ処理には移行させない
 
         if mode == "delete":
             target_action = get_deletable_action(ix, iy)
@@ -2280,45 +2309,7 @@ def mouse_callback(event, x, y, flags, param):
                     request_canvas_render()
 
         elif mode == "numbering" and ix < w_orig:
-            if is_click:
-                save_undo_state()
-                
-                if "ガヤ" in current_name:
-                    # a) 現在のページ上の古い名前ラベルをクリーンアップ
-                    for act in list(drawn_actions):
-                        if isinstance(act, TextShape) and getattr(act, "char_name", "") == current_name:
-                            drawn_actions.remove(act)
-                            
-                    # ★修正: ディスクアクセスを廃止し GLOBAL_MEMORY 上でクリーンアップ
-                    for p in range(TOTAL_PAGES):
-                        if p == page_idx: continue
-                        mem = GLOBAL_MEMORY.get(p, {})
-                        acts = mem.get("drawn_actions", [])
-                        original_len = len(acts)
-                        
-                        # TextShapeかつ名前が一致するものを除外
-                        filtered_acts = [
-                            a for a in acts 
-                            if not (getattr(a, "shape_type", "") == "text" and getattr(a, "char_name", "") == current_name)
-                        ]
-                        
-                        if len(filtered_acts) != original_len:
-                            GLOBAL_MEMORY[p]["drawn_actions"] = filtered_acts
-                            GLOBAL_MEMORY[p]["is_dirty"] = True
-                            _async_save_bg(p, filtered_acts, mem.get("number_counter", 1))
-                    
-                    # b) 次の番号を取得
-                    next_num = get_next_gaya_number(current_name)
-                    
-                    # c) GayaShape を追加（現在の反転状態を取得して適用）
-                    p_item = PALETTE[current_palette_idx] if current_palette_idx < len(PALETTE) else {}
-                    new_gaya = GayaShape([ix, iy], current_name, next_num, current_color_bgr, p_item.get("is_inverted", False))
-                    drawn_actions.append(new_gaya)
-                else:
-                    # 通常のセリフ番号
-                    drawn_actions.append(NumberShape([ix, iy], number_counter))
-                    number_counter += 1
-                request_canvas_render()
+            pass # [AI Constraint] LBUTTONDOWN に移行したため削除
 
         elif mode == "line" and ix < w_orig:
             if not is_click:
@@ -2886,7 +2877,7 @@ while True:
                     if loaded_pal:
                         PALETTE = loaded_pal
                         current_palette_idx = 0
-                        current_color_bgr = PALETTE[0]["color"]
+                        current_color_bgr = PALETTE[0]["color_bgr"]
                         current_name = PALETTE[0]["name"]
                         save_project_palette(PALETTE, os.path.join(WORK_DIR, "project_characters.csv"))
                         print(f"🔄 パレットを {os.path.basename(new_csv_path)} の内容で上書き更新しました")
